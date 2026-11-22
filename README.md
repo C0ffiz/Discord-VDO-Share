@@ -39,16 +39,33 @@ Discord + BetterDiscord                                   Navegador de quem assi
 - **Envio:** pelo [SDK do VDO.Ninja](https://github.com/steveseguin/ninjasdk) (`@vdoninja/sdk` **1.6.2**, MPL-2.0) com `salt: "vdo.ninja"`. Assim, um link comum `https://vdo.ninja/?view=ID` assiste à transmissão.
 - **Download do SDK:** o SDK é baixado do jsDelivr (ou unpkg) ao iniciar. O plugin confere o **SHA-256** fixado e recusa qualquer arquivo diferente.
 
-### Qualidade
+### Qualidade: desbloqueada e personalizável
 
-| | Padrão |
-|---|---|
-| Resolução | a escolhida no seletor do Discord, **no mínimo 1080p** (sem Nitro o seletor só mostra 720p, mas a mídia não passa pelo Discord) |
-| FPS | o do seletor (15/30/60) |
-| Bitrate | automático, de 1,5 a 12 Mbps conforme resolução × FPS |
-| Conteúdo | "Melhor legibilidade" (≤ 15 fps) usa `contentHint = detail`; o resto usa `motion` |
+**Seletor do Go Live desbloqueado (sem Nitro).** O plugin sobrescreve as duas verificações que o seletor do Discord consulta: o validador `canStreamWithSettings` e a checagem de preset/resolução/FPS. São os mesmos pontos documentados pelo [YABDP4Nitro](https://github.com/riolubruh/YABDP4Nitro); a implementação aqui é própria. Com isso, todas as opções ficam selecionáveis: 720p, 1080p, 1440p, **Nativa**, 15/30/**60** fps. O que você escolher é o que o plugin captura e envia.
 
-Tudo pode ser fixado nas configurações (resolução, FPS, bitrate máximo).
+**Qualidade personalizada.** Para valores fora do seletor (4K, 120 fps, um bitrate fixo…), ligue **"Usar qualidade personalizada"**. Ela pode ser ajustada em três lugares:
+
+- pelo botão **⚙ VDOShare** no rodapé da janela do Go Live;
+- pelo comando **`/vdoshare-qualidade`**;
+- em **Configurações → Qualidade**.
+
+| Opção | Padrão | Observação |
+|---|---|---|
+| Resolução (altura) | a do seletor | 0 = nativa; até 4320 px. Telas ultrawide mantêm a altura pedida |
+| FPS | o do seletor | 1–240 |
+| Bitrate máximo | automático (1,5–20 Mbps conforme resolução × FPS) | cada espectador consome esse upload |
+| Bitrate mínimo | nenhum | nem todo navegador respeita |
+| Bitrate do áudio | padrão do SDK | — |
+| Codec de vídeo | automático | H.264 / VP9 / AV1 / VP8 (preferência do transmissor) |
+
+Predefinições de um clique: **4K 60**, **1440p 60**, **1080p 120**, **1080p 60**, **720p 60**, **Texto (1440p 15)**, **Nativa 60** e **Seguir o Discord**.
+
+**Mudanças ao vivo, sem derrubar quem assiste:**
+- **Resolução ou FPS:** a fonte é recapturada e a faixa é trocada na mesma conexão (`replaceTrack`).
+- **Bitrate ou codec:** aplicados direto nas conexões (`updatePublisherMedia`).
+- **Pelo Discord:** mudar a qualidade durante a transmissão no próprio popout do Discord também funciona.
+
+Com "Melhor legibilidade" (≤ 15 fps), o plugin usa `contentHint = detail`. Acima disso, usa `motion`.
 
 ### Áudio
 
@@ -97,6 +114,8 @@ Não é preciso bot nem token.
 3. O seu nome ganha o selo **AO VIVO**, o perfil mostra **"Assistir Transmissão"** e o link de visualização é copiado.
 4. Para encerrar, use **Parar transmissão** no Discord. Fechar a janela compartilhada também encerra a transmissão.
 
+**Qualidade:** no seletor do Go Live, todas as resoluções e FPS ficam liberadas. O botão **⚙ VDOShare** no rodapé (ou `/vdoshare-qualidade`) abre o ajuste fino, que pode ser usado também com a transmissão no ar.
+
 **Sem canal de voz:** o comando **`/vdoshare`** abre um seletor do plugin (com opção de áudio no Windows) e transmite do mesmo jeito. Rode `/vdoshare` de novo para encerrar.
 
 **Modo navegador:** em **Configurações → Ações → Navegador**, o plugin abre o VDO.Ninja no seu navegador padrão. Ali o seletor do Chrome/Edge permite compartilhar o **áudio de uma aba**. O encerramento usa o API remoto do VDO.Ninja (`&api=`), e o plugin percebe quando você fecha a aba.
@@ -117,12 +136,12 @@ Não é preciso bot nem token.
 |---|---|---|
 | Ações | Transmitir/encerrar (escolher fonte), modo navegador, copiar link, gerar novo ID | — |
 | Transmissão | Usar o Go Live do Discord | Ligado |
-| | Resolução: seguir o seletor (mín. 1080p) / 720p / 1080p / 1440p / nativa | Seguir o seletor |
-| | FPS: seguir o seletor / 30 / 60 | Seguir o seletor |
-| | Bitrate máximo (kbps) | Automático |
 | | Manter imagem em telas paradas | Ligado |
 | | ID fixo ou novo a cada transmissão, Stream ID, rótulo | Fixo |
 | | Servidor de sinalização | Padrão do VDO.Ninja |
+| Qualidade | Ajuste rápido (predefinições, aplica ao vivo) | — |
+| | Desbloquear todas as opções do Go Live | Ligado |
+| | Qualidade personalizada: resolução, FPS, bitrate máx./mín., bitrate do áudio, codec | Desligado (segue o seletor) |
 | Link de visualização | `&stereo`, `&bitrate`, `&codec`, mensagem de espera, parâmetros extras | `&stereo` + mensagem |
 | Rich Presence | Ativar, Application ID, nome, tipo (Assistindo…), linhas, nº de espectadores, texto do botão, imagem, copiar link | Assistindo |
 | Modo navegador | Parâmetros extras do transmissor, URL da API | — |
@@ -142,6 +161,8 @@ Não é preciso bot nem token.
 | Tela preta para quem assiste | Aguarde alguns segundos. Confirme que "Manter imagem em telas paradas" está ligado. |
 | Sem som | Só o Windows captura áudio no Discord. No macOS e no Linux, use o Modo navegador com uma aba. |
 | O botão "Assistir Transmissão" não aparece para os outros | Confira o **Application ID** e a opção de compartilhar atividade. |
+| O seletor do Go Live continua com opções travadas | Uma atualização do Discord mudou as verificações. Use **qualidade personalizada** (funciona mesmo assim) e abra uma issue. |
+| O botão ⚙ VDOShare não aparece na janela do Go Live | O layout da janela mudou. Use `/vdoshare-qualidade` ou as configurações do plugin. |
 | Travando ou com baixa qualidade | Reduza a resolução, o FPS ou o bitrate máximo. Cada espectador consome upload. |
 | Quero o Go Live normal do Discord | Desative **"Usar o Go Live do Discord"** ou o plugin. |
 
@@ -150,3 +171,4 @@ Não é preciso bot nem token.
 - Ponte do Go Live nativo adaptada de [ADCDS/discord-byo-stream](https://github.com/ADCDS/discord-byo-stream) (MIT; veja [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)).
 - [VDO.Ninja](https://vdo.ninja) e o [SDK do VDO.Ninja](https://github.com/steveseguin/ninjasdk), de Steve Seguin (MPL-2.0).
 - Rich Presence local inspirado no plugin CustomRPC do Vencord.
+- Pontos de desbloqueio da qualidade do Go Live identificados a partir do [YABDP4Nitro](https://github.com/riolubruh/YABDP4Nitro) (OSL-3.0). Nenhum código dele foi copiado; a implementação é própria.
