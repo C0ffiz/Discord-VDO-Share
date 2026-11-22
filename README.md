@@ -67,7 +67,22 @@ Discord + BetterDiscord                                   Navegador de quem assi
 | Som ligado/desligado | a faixa de áudio é adicionada ou removida (`addTrack`/`removeTrack`) |
 | Bitrate ou codec | aplicado direto nas conexões (`updatePublisherMedia`), sem recapturar |
 
-Bitrate automático: de 1,5 a 20 Mbps, conforme resolução × FPS. Cada espectador consome esse upload. Com 15 fps ou menos (modo "Compartilhamento de tela"), o plugin usa `contentHint = detail`; acima disso, usa `motion`.
+Bitrate automático: de 1,5 a 20 Mbps, conforme resolução × FPS. Cada espectador consome esse upload.
+
+### Desempenho e nitidez
+
+- **Codificação na GPU.** Com o codec em "Automático", o plugin pergunta ao Chromium do Discord (`mediaCapabilities`) qual codec ele consegue codificar na placa de vídeo (NVENC, Quick Sync, AMF). A ordem de preferência é H.264, AV1 e depois VP9; o H.264 vem primeiro porque qualquer espectador decodifica na própria GPU. Sem GPU disponível, fica com H.264, o encoder de software mais leve. O aviso ao iniciar mostra o resultado, por exemplo "H.264 (GPU)". O link de visualização pede o mesmo codec (`&codec=`), porque é a resposta do espectador que decide o codec usado.
+- **Um encoder por espectador.** Como a transmissão é P2P, cada pessoa assistindo custa mais uma codificação (e mais upload). Com vários espectadores, prefira H.264 na GPU e um bitrate menor.
+- **Sem imagem borrada no início.** O SDK aplica o bitrate antes de o vídeo ser negociado, e o valor pode se perder. O Chrome também reduzia a resolução enquanto a banda subia e demorava para voltar. Agora o plugin reaplica bitrate, FPS, resolução cheia e a prioridade direto em cada conexão logo que o espectador conecta, e confere de novo a cada 5 s.
+- **Com pouca banda, priorizar:**
+  - **Nitidez** (padrão): mantém a resolução e reduz FPS se faltar banda; é o que evita a imagem borrada.
+  - **Equilibrado**.
+  - **Fluidez**: mantém o FPS e reduz a resolução; bom para jogos.
+
+  O modo "Compartilhamento de tela" do Discord (≤ 15 fps) sempre usa Nitidez.
+- **Nenhuma captura fica rodando.** Toda captura aberta pelo plugin é registrada e encerrada quando a transmissão termina, inclusive se uma troca de faixa falhar. Assim o "Service Host: CaptureService" do Windows não continua consumindo CPU.
+- **Prévias nativas do Discord.** Só a lista de fontes da janela do Go Live usa as miniaturas do Chromium. O resto do Discord continua com as prévias nativas, bem mais leves.
+- **"Reenviar quadros em telas paradas"** vem desligado. Ele processa cada quadro em JavaScript, gasta CPU e faz o Chrome tratar a tela como câmera, o que reduz a nitidez. Só ative se quem entra vir tela preta com a tela parada.
 
 ### Áudio
 
@@ -138,12 +153,13 @@ Não é preciso bot nem token.
 |---|---|---|
 | Ações | Transmitir/encerrar (escolher fonte), modo navegador, copiar link, gerar novo ID | — |
 | Transmissão | Usar o Go Live do Discord | Ligado |
-| | Manter imagem em telas paradas | Ligado |
+| | Reenviar quadros em telas paradas | Desligado |
 | | ID fixo ou novo a cada transmissão, Stream ID, rótulo | Fixo |
 | | Servidor de sinalização | Padrão do VDO.Ninja |
 | Qualidade | Resolução e FPS (mostra os atuais do Go Live; botão "Alterar") | os do Go Live do Discord |
 | | Liberar opções Nitro da transmissão | Ligado |
-| | Bitrate máx./mín., bitrate do áudio, codec | Automático |
+| | Bitrate máx./mín., bitrate do áudio, codec (Automático = GPU quando disponível) | Automático |
+| | Com pouca banda, priorizar: Nitidez / Equilibrado / Fluidez | Nitidez |
 | Link de visualização | `&stereo`, `&bitrate`, `&codec`, mensagem de espera, parâmetros extras | `&stereo` + mensagem |
 | Rich Presence | Ativar, Application ID, nome, tipo (Assistindo…), linhas, nº de espectadores, texto do botão, imagem, copiar link | Assistindo |
 | Modo navegador | Parâmetros extras do transmissor, URL da API | — |
@@ -160,12 +176,13 @@ Não é preciso bot nem token.
 |---|---|
 | O botão "Compartilhar Tela" continua travado | Veja o status em **Configurações → Ações**. Uma atualização do Discord pode ter mudado o experimento ou os módulos: use `/vdoshare` enquanto isso e abra uma issue com o erro do console (Ctrl+Shift+I). |
 | "não foi possível carregar o SDK" | O jsDelivr e o unpkg estão inacessíveis na sua rede ou o arquivo mudou. Tente de novo mais tarde. |
-| Tela preta para quem assiste | Aguarde alguns segundos. Confirme que "Manter imagem em telas paradas" está ligado. |
+| Tela preta para quem assiste com a tela parada | Mexa em algo na tela ou ative "Reenviar quadros em telas paradas". |
 | Sem som | Só o Windows captura áudio no Discord. No macOS e no Linux, use o Modo navegador com uma aba. |
 | O botão "Assistir Transmissão" não aparece para os outros | Confira o **Application ID** e a opção de compartilhar atividade. |
 | Opções do Go Live continuam com cadeado, ou o SD/HD e o banner do Nitro aparecem | Uma atualização do Discord mudou a janela. Use `/vdoshare-qualidade` (resolução, FPS e bitrate funcionam mesmo assim) e abra uma issue com o erro do console. |
 | O submenu VDOShare não aparece no menu ⚙ | Mesmo caso: use `/vdoshare-qualidade` ou as configurações do plugin. |
 | Travando ou com baixa qualidade | Reduza a resolução, o FPS ou o bitrate máximo. Cada espectador consome upload. |
+| CPU alta ao transmitir | Veja no aviso ao iniciar se aparece "(GPU)". Se aparecer "(CPU)", a GPU não codifica aquele codec: teste outro codec, reduza a resolução/FPS ou o número de espectadores. Resoluções como 4K/Fonte a 120+ fps também pesam na captura do Windows (CaptureService). |
 | Quero o Go Live normal do Discord | Desative **"Usar o Go Live do Discord"** ou o plugin. |
 
 ## Créditos

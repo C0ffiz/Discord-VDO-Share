@@ -3,7 +3,7 @@
  * @author C0ffiz
  * @authorLink https://github.com/C0ffiz
  * @description Reativa o Go Live nativo do Discord ("Compartilhar Tela") e transmite a tela direto do Discord via VDO.Ninja (P2P), com um Rich Presence "Assistir Transmissão" para quem quiser assistir no navegador.
- * @version 2.2.0
+ * @version 2.3.0
  * @source https://github.com/C0ffiz/Discord-VDO-Share
  * @website https://github.com/C0ffiz/Discord-VDO-Share
  * @updateUrl https://raw.githubusercontent.com/C0ffiz/Discord-VDO-Share/main/VDOShare.plugin.js
@@ -72,7 +72,7 @@ const GO_LIVE_MODAL_SOURCE = "GQgGHISKZ5aYqYeYhX9isDUHGw";
 
 const CODEC_OPTIONS = [
     {label: "Automático", value: ""},
-    {label: "H.264 (menos CPU com aceleração)", value: "h264"},
+    {label: "H.264", value: "h264"},
     {label: "VP9", value: "vp9"},
     {label: "AV1", value: "av1"},
     {label: "VP8", value: "vp8"}
@@ -87,6 +87,12 @@ const EXTRA_RESOLUTIONS = [2160];
 const FPS_OPTIONS = [5, 15, 30, 60, 90, 120, 144, 240];
 const EXTRA_FPS = [90, 120, 144, 240];
 const BITRATE_OPTIONS = [0, 2500, 4000, 6000, 8000, 12000, 20000, 30000];
+const PRIORITY_OPTIONS = [
+    {label: "Nitidez (texto e detalhes)", value: "sharp", hint: "detail", degradation: "maintain-resolution"},
+    {label: "Equilibrado", value: "balanced", hint: "motion", degradation: "balanced"},
+    {label: "Fluidez (jogos e vídeo)", value: "smooth", hint: "motion", degradation: "maintain-framerate"}
+];
+const CODEC_NAMES = {h264: "H.264", vp9: "VP9", av1: "AV1", vp8: "VP8"};
 const INSTALL_GIVE_UP_MS = 60000;
 
 const DEFAULTS = {
@@ -99,7 +105,9 @@ const DEFAULTS = {
     minBitrate: 0,              // kbps, 0 = none
     audioBitrate: 0,            // kbps, 0 = SDK default
     videoCodec: "",             // publisher preference: "" | "h264" | "vp9" | "av1" | "vp8"
-    keepAlive: true,
+    keepAlive: false,           // JS frame re-sender; costs CPU and hides "screen content" from the encoder
+    qualityPriority: "sharp",   // "sharp" | "balanced" | "smooth": what the encoder keeps when bandwidth/CPU is short
+    settingsVersion: 0,
     streamLabel: "",
     signalingHost: "",          // empty = SDK default (wss://wss.vdo.ninja)
     takeOverGoLive: true,
@@ -186,6 +194,33 @@ function listSources() {
     return capture.getDesktopCaptureSources({types: ["screen", "window"], thumbnailSize: {width: 320, height: 180}});
 }
 
+// Every raw capture track VDOShare opens. Anything still live here after a stream
+// ends is stopped, so no Windows capture session (CaptureService) is left running.
+const CAPTURES = new Set();
+
+async function captureMedia(constraints) {
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const tracks = stream.getTracks?.() ?? [...(stream.getVideoTracks?.() ?? []), ...(stream.getAudioTracks?.() ?? [])];
+    for (const track of tracks) {
+        CAPTURES.add(track);
+        track.addEventListener?.("ended", () => CAPTURES.delete(track));
+    }
+    return stream;
+}
+
+/** Stops every capture track except the ones in `keep`. Returns how many were stopped. */
+function sweepCaptures(keep = []) {
+    let stopped = 0;
+    for (const track of [...CAPTURES]) {
+        if (keep.includes(track)) continue;
+        if (track.readyState !== "ended") {
+            try { track.stop(); stopped++; } catch (_) { /* ignore */ }
+        }
+        CAPTURES.delete(track);
+    }
+    return stopped;
+}
+
 // Discord sets no display-media handler, so getDisplayMedia is unavailable;
 // Electron's chromeMediaSource constraints are used instead. Only Windows can
 // capture system audio this way, and it is the *whole* system output.
@@ -195,7 +230,7 @@ async function captureSource({sourceId, width, height, fps, wantAudio}) {
     if (wantAudio && !isWindows()) audioError = "o Discord só consegue capturar o áudio do sistema no Windows";
     if (wantAudio && !audioError) {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({audio: {mandatory: {chromeMediaSource: "desktop"}}, video});
+            const stream = await captureMedia({audio: {mandatory: {chromeMediaSource: "desktop"}}, video});
             const audio = stream.getAudioTracks()[0] ?? null;
             return {video: stream.getVideoTracks()[0], audio, audioError: audio ? null : "nenhuma faixa de áudio"};
         }
@@ -203,7 +238,7 @@ async function captureSource({sourceId, width, height, fps, wantAudio}) {
             audioError = `${error.name}: ${error.message}`; // a failed audio capture must not cost the video
         }
     }
-    const stream = await navigator.mediaDevices.getUserMedia({audio: false, video});
+    const stream = await captureMedia({audio: false, video});
     return {video: stream.getVideoTracks()[0], audio: null, audioError};
 }
 
@@ -386,7 +421,23 @@ class GoLiveBridge {
             for (const name of ["getUseSystemScreensharePicker", "supportsSystemScreensharePicker"]) {
                 if (typeof this.mediaEngine[name] === "function") this.undo.push(P.instead(this.mediaEngine, name, () => false));
             }
-            if (engine && typeof engine.supports === "function") {
+            // Only the Go Live picker's source list uses Chromium's sources (ids we can
+            // capture). Everything else in Discord keeps the native, much cheaper
+            // previews: forcing Chromium thumbnails everywhere made Windows'
+            // CaptureService keep capturing windows in the background.
+            const lister = this.api.Webpack.getModule(this.api.Webpack.Filters.bySource("Can't get desktop sources outside of native app"));
+            const listerKey = lister && Object.keys(lister).find(k => typeof lister[k] === "function");
+            if (listerKey) {
+                this.undo.push(P.instead(lister, listerKey, (_, [mediaEngine, ...rest], original) => {
+                    if (!this.plugin.settings.takeOverGoLive || !mediaEngine) return original(mediaEngine, ...rest);
+                    const chromiumOnly = Object.create(mediaEngine, {
+                        supports: {value: (feature) => (feature === "SCREEN_PREVIEWS" || feature === "WINDOW_PREVIEWS" ? false : mediaEngine.supports(feature))}
+                    });
+                    return original(chromiumOnly, ...rest);
+                }));
+            }
+            else if (engine && typeof engine.supports === "function") {
+                // Fallback (lister not found): same as before, globally.
                 this.undo.push(P.instead(engine, "supports", (_, [feature], original) =>
                     feature === "SCREEN_PREVIEWS" || feature === "WINDOW_PREVIEWS" ? false : original(feature)));
             }
@@ -538,9 +589,17 @@ class GoLiveBridge {
         this.pendingSource = null;
         this.starting = true;
         this.startingSource = source;
+        const wasLive = Boolean(this.own.started);
         this.startSharing(source)
             .then(() => { this.activeSource = source; })
             .catch((error) => {
+                if (wasLive && this.own && this.plugin.share) {
+                    // A failed change (quality/source/sound) must not end a running stream.
+                    this.log("change failed, keeping the current stream", error);
+                    this.api.UI.showToast(`VDOShare: não consegui aplicar a mudança — ${error.message}. A transmissão continua como estava.`, {type: "warning", timeout: 8000});
+                    this.plugin.writeDiscordQuality({...this.plugin.share.source, sound: Boolean(this.plugin.share.source?.sound)});
+                    return;
+                }
                 this.log("stream failed", error);
                 this.api.UI.showToast(`VDOShare: não foi possível transmitir — ${error.message}`, {type: "error", timeout: 8000});
                 const own = this.own;
@@ -728,6 +787,7 @@ module.exports = class VDOShare {
         this.bridge?.uninstall();
         this.bridge = null;
         this.endShare({silent: true});
+        sweepCaptures();
         this.restoreQualityLists();
         this.clearPresence();
         this.api.Patcher.unpatchAll();
@@ -761,6 +821,13 @@ module.exports = class VDOShare {
             delete s.customQuality;
             delete s.customHeight;
             delete s.customFps;
+            changed = true;
+        }
+        if ((Number(s.settingsVersion) || 0) < 1) {
+            // v2.3: the frame re-sender was the default before; it costs CPU and
+            // makes Chrome treat the screen like a camera (blurry start).
+            s.keepAlive = false;
+            s.settingsVersion = 1;
             changed = true;
         }
         return changed;
@@ -1061,7 +1128,11 @@ module.exports = class VDOShare {
         const autoKbps = this.resolvePreset({resolution: preset?.resolution ?? 720, fps: preset?.frameRate ?? 30}, {ignoreOverrides: true}).maxBitrateKbps;
         const mbps = (kbps) => `${(kbps / 1000).toLocaleString("pt-BR", {maximumFractionDigits: 1})} Mbps`;
         const currentBitrate = Number(s.maxBitrate) > 0 ? mbps(Number(s.maxBitrate)) : `Automático (${mbps(autoKbps)})`;
-        const currentCodec = CODEC_OPTIONS.find(o => o.value === (s.videoCodec || ""))?.label ?? "Automático";
+        const codecInUse = s.videoCodec || this.share?.preset?.codec || this.autoCodec || "";
+        const currentCodec = s.videoCodec
+            ? (CODEC_OPTIONS.find(o => o.value === s.videoCodec)?.label ?? s.videoCodec)
+            : (codecInUse ? `Automático (${this.encoderLabel(codecInUse)})` : "Automático");
+        const priority = PRIORITY_OPTIONS.find(o => o.value === s.qualityPriority) ?? PRIORITY_OPTIONS[0];
         return this.menuItem("item", {
             id: `${prefix}-vdoshare`,
             label: "VDOShare",
@@ -1086,9 +1157,21 @@ module.exports = class VDOShare {
                     children: CODEC_OPTIONS.map(option => this.menuItem("radio", {
                         group: `${prefix}-vdoshare-codec`,
                         id: `${prefix}-vdoshare-codec-${option.value || "auto"}`,
-                        label: option.label,
+                        label: option.value ? option.label : `Automático${this.autoCodec ? ` (${this.encoderLabel(this.autoCodec)})` : " (GPU quando disponível)"}`,
                         checked: (s.videoCodec || "") === option.value,
                         action: () => this.setVdoShareSetting("videoCodec", option.value)
+                    }))
+                }),
+                this.menuItem("item", {
+                    id: `${prefix}-vdoshare-priority`,
+                    label: "Com pouca banda, priorizar",
+                    subtext: priority.label,
+                    children: PRIORITY_OPTIONS.map(option => this.menuItem("radio", {
+                        group: `${prefix}-vdoshare-priority`,
+                        id: `${prefix}-vdoshare-priority-${option.value}`,
+                        label: option.label,
+                        checked: s.qualityPriority === option.value,
+                        action: () => this.setVdoShareSetting("qualityPriority", option.value)
                     }))
                 }),
                 this.menuItem("separator", {}),
@@ -1109,7 +1192,13 @@ module.exports = class VDOShare {
     setVdoShareSetting(key, value) {
         this.settings[key] = value;
         this.saveSettings();
-        if (this.share?.vdo) this.applyQualityLive();
+        const share = this.share;
+        if (key === "videoCodec" && share) {
+            // New viewers get the new codec: refresh the link in the Rich Presence.
+            share.viewerUrl = this.buildViewerUrl(share.streamId);
+            this.setPresence();
+        }
+        if (share?.vdo) this.applyQualityLive();
     }
 
     /**
@@ -1186,7 +1275,8 @@ module.exports = class VDOShare {
             maxBitrate: Number(s.maxBitrate) || 0,
             minBitrate: Number(s.minBitrate) || 0,
             audioBitrate: Number(s.audioBitrate) || 0,
-            videoCodec: s.videoCodec || ""
+            videoCodec: s.videoCodec || "",
+            qualityPriority: s.qualityPriority || "sharp"
         };
         const options = (values, label) => {
             const list = values.map(v => ({label: label(v), value: v}));
@@ -1206,13 +1296,16 @@ module.exports = class VDOShare {
             item({type: "number", id: "maxBitrate", name: "Bitrate máximo (kbps)", note: "0 = automático pela resolução/FPS.", min: 0, max: 100000}),
             item({type: "number", id: "minBitrate", name: "Bitrate mínimo (kbps)", note: "0 = sem mínimo. Nem todo navegador respeita.", min: 0, max: 100000}),
             item({type: "number", id: "audioBitrate", name: "Bitrate do áudio (kbps)", note: "0 = padrão.", min: 0, max: 510}),
-            item({type: "dropdown", id: "videoCodec", name: "Codec de vídeo", note: "Preferência do transmissor.", options: CODEC_OPTIONS}));
+            item({type: "dropdown", id: "videoCodec", name: "Codec de vídeo", note: "Automático usa a GPU quando disponível.", options: CODEC_OPTIONS}),
+            item({type: "dropdown", id: "qualityPriority", name: "Com pouca banda, priorizar", note: "Nitidez evita a imagem borrada no início.", options: PRIORITY_OPTIONS.map(({label, value}) => ({label, value}))}));
 
         this.api.UI.showConfirmationModal("Qualidade da transmissão", content, {
             confirmText: "Aplicar",
             cancelText: "Cancelar",
             onConfirm: () => {
-                Object.assign(s, {maxBitrate: draft.maxBitrate, minBitrate: draft.minBitrate, audioBitrate: draft.audioBitrate, videoCodec: draft.videoCodec});
+                const codecChanged = (s.videoCodec || "") !== draft.videoCodec;
+                Object.assign(s, {maxBitrate: draft.maxBitrate, minBitrate: draft.minBitrate, audioBitrate: draft.audioBitrate, videoCodec: draft.videoCodec, qualityPriority: draft.qualityPriority});
+                if (codecChanged && this.share) { this.share.viewerUrl = this.buildViewerUrl(this.share.streamId); this.setPresence(); }
                 this.saveSettings();
                 const qualityChanged = draft.resolution !== current.resolution || draft.fps !== current.fps;
                 if (qualityChanged) this.requestLiveQuality({resolution: draft.resolution, fps: draft.fps});
@@ -1228,7 +1321,9 @@ module.exports = class VDOShare {
         if (!share?.vdo || !share.source) return;
         try {
             share.preset = this.resolvePreset(share.source);
+            if (share.rawVideoTrack) share.rawVideoTrack.contentHint = this.contentHintFor(share.preset);
             await this.applyEncoding(share, share.preset);
+            this.enforceSenderParameters();
             this.api.UI.showToast(`VDOShare: aplicado ao vivo — ${share.preset.label}, ${share.preset.maxBitrateKbps} kbps.`, {type: "success"});
         }
         catch (error) {
@@ -1282,6 +1377,9 @@ module.exports = class VDOShare {
             const uuid = event.detail?.uuid;
             if (uuid) viewers.add(uuid);
             this.onViewersChanged(viewers.size);
+            // The SDK sets bitrate before the video track is negotiated, which can be
+            // lost: re-apply once the connection is up (and again as it settles).
+            for (const delay of [300, 1500, 4000]) setTimeout(() => this.enforceSenderParameters(), delay);
         });
         vdo.addEventListener("peerDisconnected", (event) => {
             viewers.delete(event.detail?.uuid);
@@ -1334,7 +1432,7 @@ module.exports = class VDOShare {
             maxBitrateKbps: override("maxBitrate") || autoKbps,
             minBitrateKbps: override("minBitrate"),
             audioBitrateKbps: override("audioBitrate"),
-            codec: s.videoCodec || "",
+            codec: s.videoCodec || this.autoCodec || "",
             sharp: frameRate <= 15,
             label: `${native ? "nativa" : height + "p"} ${frameRate}fps`
         };
@@ -1352,6 +1450,114 @@ module.exports = class VDOShare {
         catch (error) {
             this.api.Logger.warn("updatePublisherMedia failed", error);
         }
+    }
+
+    /**
+     * "Automático" codec: the first one Discord's Chromium can encode on the GPU
+     * (mediaCapabilities "powerEfficient"), preferring H.264 because every viewer
+     * can decode it in hardware. Falls back to H.264, the cheapest software encoder.
+     */
+    async detectEncoder(preset) {
+        if (this.settings.videoCodec) return;
+        const height = preset.resolution || 1440;
+        const width = Math.round(height * 16 / 9);
+        const key = `${width}x${height}@${preset.frameRate}`;
+        if (this.autoCodecKey === key) return;
+        let codec = "h264";
+        let hardware = null;
+        const mc = navigator.mediaCapabilities;
+        if (mc?.encodingInfo) {
+            const candidates = [["h264", ["video/H264", "video/h264"]], ["av1", ["video/AV1"]], ["vp9", ["video/VP9"]]];
+            for (const [name, types] of candidates) {
+                let info = null;
+                for (const contentType of types) {
+                    try {
+                        info = await mc.encodingInfo({type: "webrtc", video: {contentType, width, height, bitrate: preset.maxBitrateKbps * 1000, framerate: preset.frameRate}});
+                        if (info?.supported) break;
+                    }
+                    catch (_) { /* unsupported query */ }
+                }
+                if (info?.supported && info.powerEfficient) {
+                    codec = name;
+                    hardware = true;
+                    break;
+                }
+                if (name === "h264" && info) hardware = info.supported ? false : null;
+            }
+        }
+        this.autoCodec = codec;
+        this.autoCodecHardware = hardware;
+        this.autoCodecKey = key;
+        this.api.Logger.log(`encoder: ${codec} (${hardware === true ? "GPU" : hardware === false ? "CPU" : "unknown"}) for ${key}`);
+    }
+
+    encoderLabel(codec) {
+        const name = CODEC_NAMES[codec] ?? "padrão";
+        if (codec && codec === this.autoCodec && !this.settings.videoCodec) {
+            if (this.autoCodecHardware === true) return `${name} (GPU)`;
+            if (this.autoCodecHardware === false) return `${name} (CPU)`;
+        }
+        return name;
+    }
+
+    priorityFor(preset) {
+        // Discord's "Screen share" preset (<= 15 fps) is always about legibility.
+        const value = preset?.sharp ? "sharp" : this.settings.qualityPriority;
+        return PRIORITY_OPTIONS.find(o => o.value === value) ?? PRIORITY_OPTIONS[0];
+    }
+
+    contentHintFor(preset) {
+        return this.priorityFor(preset).hint;
+    }
+
+    /**
+     * Applies bitrate, frame rate, full resolution and the degradation preference
+     * straight to every viewer's RTCRtpSender. The SDK sets these before the video
+     * track is negotiated, where they can be lost (blurry 1080p until a quality
+     * change re-applied them), and it has no degradation preference at all.
+     */
+    enforceSenderParameters() {
+        const share = this.share;
+        const groups = share?.vdo?.connections;
+        if (!groups?.values || !share.preset) return;
+        const preset = share.preset;
+        const degradation = this.priorityFor(preset).degradation;
+        for (const group of groups.values()) {
+            const pc = group?.publisher?.pc;
+            if (typeof pc?.getSenders !== "function") continue;
+            for (const sender of pc.getSenders()) {
+                if (sender.track?.kind !== "video") continue;
+                this.applySenderParameters(sender, preset, degradation).catch(error => this.api.Logger.warn("setParameters failed", error));
+            }
+        }
+    }
+
+    async applySenderParameters(sender, preset, degradation, withDegradation = true) {
+        let params;
+        try { params = sender.getParameters(); } catch (_) { return; }
+        if (!params?.encodings?.length) return; // not negotiated yet; the next pass gets it
+        const encoding = params.encodings[0];
+        let changed = false;
+        const maxBitrate = preset.maxBitrateKbps * 1000;
+        if (encoding.maxBitrate !== maxBitrate) { encoding.maxBitrate = maxBitrate; changed = true; }
+        if (encoding.maxFramerate !== preset.frameRate) { encoding.maxFramerate = preset.frameRate; changed = true; }
+        if (encoding.scaleResolutionDownBy !== undefined && encoding.scaleResolutionDownBy !== 1) { encoding.scaleResolutionDownBy = 1; changed = true; }
+        if (withDegradation && params.degradationPreference !== degradation) { params.degradationPreference = degradation; changed = true; }
+        if (!changed) return;
+        try {
+            await sender.setParameters(params);
+        }
+        catch (error) {
+            // Older Chromium builds reject degradationPreference; keep the rest.
+            if (withDegradation) return this.applySenderParameters(sender, preset, degradation, false);
+            throw error;
+        }
+    }
+
+    /** Re-checks sender parameters while live (cheap: reads parameters, writes only on drift). */
+    startSenderWatch() {
+        clearInterval(this.senderWatch);
+        this.senderWatch = setInterval(() => this.enforceSenderParameters(), 5000);
     }
 
     /** SDK media options (publish / updatePublisherMedia) for a preset. */
@@ -1381,6 +1587,7 @@ module.exports = class VDOShare {
                 if (!picked) throw new Error("seleção de fonte cancelada");
                 ({id: sourceId, name: sourceName} = picked);
             }
+            await this.detectEncoder(this.resolvePreset(source));
             const preset = this.resolvePreset(source);
             const captured = await captureSource({sourceId, width: preset.width, height: preset.height, fps: preset.frameRate, wantAudio: source.sound});
             if (source.sound && !captured.audio) {
@@ -1389,7 +1596,7 @@ module.exports = class VDOShare {
             else if (captured.audio && isWindows()) {
                 this.api.UI.showToast("VDOShare: o áudio do sistema inclui o som da chamada de voz.", {type: "info", timeout: 6000});
             }
-            captured.video.contentHint = preset.sharp ? "detail" : "motion";
+            captured.video.contentHint = this.contentHintFor(preset);
             const videoTrack = this.settings.keepAlive ? keepAlive(captured.video) : captured.video;
 
             const streamId = this.ensureStreamId();
@@ -1397,7 +1604,7 @@ module.exports = class VDOShare {
                 mode, streamId, sourceId, sourceName,
                 viewerUrl: this.buildViewerUrl(streamId),
                 startedAt: Date.now(),
-                videoTrack, audioTrack: captured.audio,
+                videoTrack, rawVideoTrack: captured.video, audioTrack: captured.audio,
                 source: {...source, sourceId, sourceName},
                 preset,
                 viewers: 0, onEnded
@@ -1410,10 +1617,11 @@ module.exports = class VDOShare {
             this.share.mediaStream = stream;
             this.share.vdo = await this.publish(stream);
             this.writeDiscordQuality({preset: source.preset, resolution: source.resolution, fps: source.fps, sound: Boolean(source.sound)});
+            this.startSenderWatch();
 
             await this.setPresence();
             if (this.settings.copyViewerLink) this.copy(this.share.viewerUrl);
-            this.api.UI.showToast(`VDOShare: ao vivo em ${preset.label} (${preset.maxBitrateKbps} kbps)` + (this.settings.copyViewerLink ? " — link copiado!" : "."), {type: "success", timeout: 6000});
+            this.api.UI.showToast(`VDOShare: ao vivo em ${preset.label} · ${preset.maxBitrateKbps} kbps · ${this.encoderLabel(preset.codec)}` + (this.settings.copyViewerLink ? " — link copiado!" : "."), {type: "success", timeout: 7000});
         }
         catch (error) {
             this.endShare({silent: true});
@@ -1449,14 +1657,23 @@ module.exports = class VDOShare {
             if (wantsNewAudio && !captured.audio) this.api.UI.showToast(`VDOShare: sem som — ${captured.audioError}`, {type: "warning", timeout: 8000});
             newAudio = captured.audio;
             if (videoChanged) {
-                captured.video.contentHint = preset.sharp ? "detail" : "motion";
+                captured.video.contentHint = this.contentHintFor(preset);
                 const videoTrack = this.settings.keepAlive ? keepAlive(captured.video) : captured.video;
                 const oldVideo = share.videoTrack;
+                try {
+                    await share.vdo.replaceTrack(oldVideo, videoTrack);
+                }
+                catch (error) {
+                    // Keep streaming the current capture; drop the new one entirely.
+                    for (const track of [videoTrack, captured.video, captured.audio]) { try { track?.stop(); } catch (_) { /* ignore */ } }
+                    error.keepStreaming = true;
+                    throw error;
+                }
                 share.videoTrack = videoTrack;
+                share.rawVideoTrack = captured.video;
                 videoTrack.addEventListener("ended", () => {
                     if (this.share?.videoTrack === videoTrack) this.share.onEnded?.();
                 });
-                await share.vdo.replaceTrack(oldVideo, videoTrack);
                 try { oldVideo.stop(); } catch (_) { /* already stopped */ }
             }
             else captured.video.stop(); // only needed it to capture the sound
@@ -1476,7 +1693,10 @@ module.exports = class VDOShare {
 
         share.source = source;
         share.preset = preset;
+        // Anything captured that the stream no longer uses must not keep running.
+        sweepCaptures([share.rawVideoTrack, share.audioTrack]);
         await this.applyEncoding(share, preset);
+        this.enforceSenderParameters();
         this.writeDiscordQuality({preset: source.preset, resolution: source.resolution, fps: source.fps, sound: Boolean(source.sound)});
         this.bridge?.notifyVideoListeners();
     }
@@ -1488,9 +1708,12 @@ module.exports = class VDOShare {
         this.share = null;
         clearTimeout(this.pollTimer);
         clearTimeout(this.presenceTimer);
+        clearInterval(this.senderWatch);
         this.clearPresence();
         try { share.videoTrack?.stop(); } catch (_) { /* ignore */ }
         try { share.audioTrack?.stop(); } catch (_) { /* ignore */ }
+        const leftovers = sweepCaptures();
+        if (leftovers) this.api.Logger.warn(`stopped ${leftovers} leftover capture track(s)`);
         if (share.vdo) {
             Promise.resolve()
                 .then(() => share.vdo.stopPublishing())
@@ -1622,7 +1845,8 @@ module.exports = class VDOShare {
             ["view", streamId],
             ["stereo", !!s.hqAudio],
             ["bitrate", Number(s.viewerBitrate) > 0 ? Number(s.viewerBitrate) : null],
-            ["codec", s.viewerCodec || null],
+            // The viewer's answer decides the codec actually used: ask for the encoder's.
+            ["codec", s.viewerCodec || s.videoCodec || this.autoCodec || null],
             ["waitmessage", s.waitMessage || null],
             ["waittimeout", s.waitMessage ? 0 : null],
             // Same form as the SDK's own example viewer link (&wss2=apibackup.vdo.ninja).
@@ -1765,7 +1989,8 @@ module.exports = class VDOShare {
         const set = (key) => (value) => {
             s[key] = value;
             this.saveSettings();
-            if (this.share && ["maxBitrate", "minBitrate", "audioBitrate", "videoCodec"].includes(key)) {
+            if (key === "videoCodec" && this.share) { this.share.viewerUrl = this.buildViewerUrl(this.share.streamId); this.setPresence(); }
+            if (this.share && ["maxBitrate", "minBitrate", "audioBitrate", "videoCodec", "qualityPriority"].includes(key)) {
                 clearTimeout(this.qualityTimer);
                 this.qualityTimer = setTimeout(() => this.applyQualityLive(), 1200);
             }
@@ -1806,7 +2031,7 @@ module.exports = class VDOShare {
                     type: "category", id: "stream", name: "Transmissão", collapsible: true, shown: true,
                     settings: [
                         sw("takeOverGoLive", "Usar o Go Live do Discord", "O botão \"Compartilhar Tela\" transmite pelo VDO.Ninja. Desative para devolver o Go Live ao Discord (onde ele estiver liberado)."),
-                        sw("keepAlive", "Manter imagem em telas paradas", "Reenvia o último quadro para quem entra não ver tela preta."),
+                        sw("keepAlive", "Reenviar quadros em telas paradas", "Só ative se quem entra vir tela preta com a tela parada. Usa mais CPU e pode deixar a imagem menos nítida."),
                         dd("idMode", "ID da transmissão", "", [
                             {label: "Fixo (link permanente)", value: "fixed"},
                             {label: "Novo a cada transmissão", value: "session"}
@@ -1826,7 +2051,8 @@ module.exports = class VDOShare {
                         num("maxBitrate", "Bitrate máximo (kbps)", "0 = automático pela resolução/FPS (1,5–20 Mbps). Cada espectador consome esse upload.", 0, 100000),
                         num("minBitrate", "Bitrate mínimo (kbps)", "0 = sem mínimo.", 0, 100000),
                         num("audioBitrate", "Bitrate do áudio (kbps)", "0 = padrão.", 0, 510),
-                        dd("videoCodec", "Codec de vídeo", "Preferência do transmissor (o link de visualização tem a sua própria opção).", CODEC_OPTIONS)
+                        dd("videoCodec", "Codec de vídeo", `Automático escolhe o que a sua GPU codifica (H.264 de preferência)${this.autoCodec ? `: agora ${this.encoderLabel(this.autoCodec)}` : ""}. Codificar na CPU, um encoder por espectador, é o que mais pesa.`, CODEC_OPTIONS),
+                        dd("qualityPriority", "Com pouca banda, priorizar", "Nitidez mantém a resolução (evita a imagem borrada no início) e reduz FPS se faltar banda.", PRIORITY_OPTIONS.map(({label, value}) => ({label, value})))
                     ]
                 },
                 {
@@ -1835,7 +2061,7 @@ module.exports = class VDOShare {
                         sw("hqAudio", "Áudio estéreo (&stereo)", ""),
                         num("viewerBitrate", "Bitrate solicitado (kbps)", "&bitrate (0 = não definir).", 0, 50000),
                         dd("viewerCodec", "Codec preferido", "&codec", [
-                            {label: "Automático", value: ""},
+                            {label: "Igual ao do transmissor", value: ""},
                             {label: "VP9", value: "vp9"},
                             {label: "H.264", value: "h264"},
                             {label: "AV1", value: "av1"},
