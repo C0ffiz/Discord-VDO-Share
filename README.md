@@ -1,116 +1,113 @@
 # Discord VDO Share
 
-Plugin para o [BetterDiscord](https://betterdiscord.app) que usa o próprio botão **"Compartilhar Tela"** do Discord para transmitir sua tela via [VDO.Ninja](https://vdo.ninja). A transmissão é **P2P (WebRTC)** e não passa pelos servidores de mídia do Discord: sem limite de 720p/30fps, sem Nitro.
+Plugin para o [BetterDiscord](https://betterdiscord.app) que **reativa o Go Live nativo do Discord** (o botão **"Compartilhar Tela"**) e transmite a sua tela **direto do Discord** via [VDO.Ninja](https://vdo.ninja), sem abrir navegador. A mídia é P2P (WebRTC) e não passa pelos servidores de mídia do Discord. Por isso funciona onde o Go Live está bloqueado (como no Brasil desde agosto de 2026) e chega a 1080p+ sem Nitro.
 
-Quando você inicia uma transmissão:
+- Você usa a interface de sempre do Discord: botão **Compartilhar Tela**, seletor de janela/tela, qualidade, selo **AO VIVO**, a sua prévia da transmissão e **Parar transmissão**.
+- O seu perfil ganha um **Rich Presence** com o botão **"Assistir Transmissão"** e o número de espectadores.
+- Quem clicar no botão assiste **no navegador**: não precisa de conta, de instalação, de configurar sala nem do plugin.
+- Parar a transmissão no Discord encerra tudo e remove o Rich Presence.
 
-1. O seu navegador abre o **seletor nativo** de tela / janela / aba, com a opção de **incluir o áudio do sistema**.
-2. O seu perfil ganha um **Rich Presence** com o botão **"Assistir Transmissão"**.
-3. Quem clicar nesse botão abre o link no navegador e assiste na hora: sem conta, sem instalar nada, sem configurar sala.
-4. Clicar de novo no botão de compartilhar tela **encerra** a transmissão e remove o Rich Presence.
+> [!WARNING]
+> Mods de cliente (BetterDiscord incluído) violam os Termos de Serviço do Discord. Use por sua conta e risco.
 
 ---
 
 ## Como funciona
 
 ```
- Discord (BetterDiscord)                          Navegador padrão (Chrome/Edge)
- ┌─────────────────────────────┐   abre link     ┌──────────────────────────────┐
- │ clique em "Compartilhar     │ ──────────────► │ vdo.ninja/?push=ID           │
- │ Tela" (interceptado)        │                 │   &screenshare&autostart     │
- │                             │                 │   &api=CHAVE ...             │
- │ Rich Presence               │                 │ seletor nativo + áudio       │
- │  [Assistir Transmissão] ────┼──┐              └──────────────┬───────────────┘
- └──────────────┬──────────────┘  │                             │ WebRTC P2P
-                │ hangup/getDetails│                             ▼
-                ▼                  │  link        ┌──────────────────────────────┐
-        api.vdo.ninja (HTTP) ──────┘ ──────────►  │ vdo.ninja/?view=ID  (quem    │
-                                                  │ assiste, em qualquer browser)│
-                                                  └──────────────────────────────┘
+Discord + BetterDiscord                                   Navegador de quem assiste
+┌────────────────────────────────────────────┐            ┌───────────────────────────┐
+│ Botão "Compartilhar Tela" (desbloqueado)   │            │ vdo.ninja/?view=ID        │
+│   → seletor do Discord → "Go Live"         │   WebRTC   │ (sem conta, sem instalar) │
+│ VDOShare intercepta as ações do Go Live,   │ ─────────► │                           │
+│ captura a fonte no próprio Discord e       │    P2P     └───────────────────────────┘
+│ publica com o SDK do VDO.Ninja             │                        ▲
+│ Rich Presence: [Assistir Transmissão] ─────┼────────── link ────────┘
+└────────────────────────────────────────────┘
 ```
 
-- **Captura fora do Discord.** O Electron do Discord não expõe o seletor de tela do navegador e tem limitações de áudio. Por isso o plugin abre a página de transmissão no seu **navegador padrão**. Ali você tem exatamente a experiência de um navegador moderno: escolher tela, janela ou aba e marcar "compartilhar áudio".
-- **Interceptação do botão.** Um listener de clique (fase de captura) reconhece o botão de compartilhar tela pelo `aria-label`, em vários idiomas, e impede o Discord de abrir o Go Live nativo.
-- **Rich Presence** via `LOCAL_ACTIVITY_UPDATE`, o mesmo mecanismo usado por plugins de RPC personalizado.
-- **Encerramento remoto.** O link do transmissor inclui `&api=CHAVE`. Ao encerrar, o plugin chama `https://api.vdo.ninja/CHAVE/hangup`. Enquanto a transmissão está ativa, ele consulta `getDetails` a cada 15 s. Se a aba for fechada, o Rich Presence é removido sozinho.
+**Ponte do Go Live nativo.** A abordagem é adaptada de [ADCDS/discord-byo-stream](https://github.com/ADCDS/discord-byo-stream) (`plugin/src/native.js`):
 
-### Links gerados (padrão)
+1. **Desbloqueio.** Sobrescreve o experimento do cliente `2026-08-video-guard` (`videoEnabled: true`), que é o que esconde ou trava o Go Live por região.
+2. **Seletor.** No Windows e no macOS, desativa o seletor de sistema e as prévias do motor nativo, para que a janela de fontes do próprio Discord entregue IDs que o Chromium consegue capturar. No Linux, o seletor do sistema (portal) é aberto pelo Chromium.
+3. **Ações.** Um interceptor no Flux Dispatcher trata `MEDIA_ENGINE_SET_GO_LIVE_SOURCE`, `STREAM_START`, `STREAM_WATCH` (a sua prévia) e `STREAM_STOP`. As chamadas de gateway **da sua transmissão** (`streamCreate`, `streamDelete`, …) são descartadas. As transmissões de outras pessoas não são afetadas.
+4. **Estado na interface.** O plugin despacha localmente `STREAM_UPDATE`, `VOICE_STATE_UPDATES` (`selfStream`) e `RTC_CONNECTION_VIDEO`. O selo AO VIVO e o bloco da sua transmissão aparecem como num Go Live normal, e o bloco mostra a sua captura.
 
-Transmissor (abre no seu navegador; **contém sua chave privada**):
+**Captura e envio.**
+- **Captura:** `getUserMedia` com `chromeMediaSource: "desktop"` e o ID da fonte escolhida no seletor do Discord.
+- **Telas paradas:** quando a imagem não muda, o plugin reenvia o último quadro (≥ 5 fps), para quem entra não ver tela preta.
+- **Envio:** pelo [SDK do VDO.Ninja](https://github.com/steveseguin/ninjasdk) (`@vdoninja/sdk` **1.6.2**, MPL-2.0) com `salt: "vdo.ninja"`. Assim, um link comum `https://vdo.ninja/?view=ID` assiste à transmissão.
+- **Download do SDK:** o SDK é baixado do jsDelivr (ou unpkg) ao iniciar. O plugin confere o **SHA-256** fixado e recusa qualquer arquivo diferente.
 
-```
-https://vdo.ninja/?push=ID&screenshare&autostart&screensharequality=0&screensharefps=60&screensharecontenthint=motion&stereo&api=CHAVE&easyexit
-```
+### Qualidade
 
-Espectador (vai no botão do Rich Presence):
+| | Padrão |
+|---|---|
+| Resolução | a escolhida no seletor do Discord, **no mínimo 1080p** (sem Nitro o seletor só mostra 720p, mas a mídia não passa pelo Discord) |
+| FPS | o do seletor (15/30/60) |
+| Bitrate | automático, de 1,5 a 12 Mbps conforme resolução × FPS |
+| Conteúdo | "Melhor legibilidade" (≤ 15 fps) usa `contentHint = detail`; o resto usa `motion` |
 
-```
-https://vdo.ninja/?view=ID&stereo&bitrate=6000&waitmessage=A%20transmiss%C3%A3o%20vai%20come%C3%A7ar%20em%20instantes...&waittimeout=0
-```
+Tudo pode ser fixado nas configurações (resolução, FPS, bitrate máximo).
 
-| Parâmetro | Lado | Por quê |
-|---|---|---|
-| `&push=ID` / `&view=ID` | ambos | Transmissão direta, sem sala (`&room`). |
-| `&screenshare` + `&autostart` | transmissor | Vai direto ao seletor de tela e começa assim que a fonte é escolhida. |
-| `&screensharequality=0` | transmissor | Alvo de 1080p (`-1` = resolução nativa). |
-| `&screensharefps=60` | transmissor | FPS alvo da captura. |
-| `&screensharecontenthint=motion` | transmissor | Prioriza fluidez (`detail` prioriza nitidez de texto). |
-| `&stereo` | ambos | Áudio estéreo de alta qualidade, sem cancelamento de eco/ruído (ideal para áudio do sistema). |
-| `&api=CHAVE` | transmissor | Permite que o plugin encerre a transmissão e detecte se a aba fechou. |
-| `&easyexit` | transmissor | Sem o pop-up "deseja sair?" ao fechar a aba. |
-| `&bitrate=6000` | espectador | Pede 6 Mbps ao transmissor (o bitrate é definido no lado de quem assiste). |
-| `&waitmessage` + `&waittimeout=0` | espectador | Mensagem amigável enquanto a transmissão conecta. |
+### Áudio
+
+O Discord não tem o seletor de áudio do navegador. O plugin captura áudio pela API de captura do Electron, que só funciona assim:
+
+| Sistema | Com "Som" ligado no seletor do Go Live |
+|---|---|
+| **Windows** | ✅ Áudio **do sistema inteiro**. ⚠️ Isso inclui o som da chamada de voz: quem estiver na chamada e assistindo pode se ouvir com atraso. |
+| macOS | ❌ sem áudio |
+| Linux | ❌ sem áudio |
+
+Para transmitir **só o áudio de uma aba** com o seletor nativo do Chrome, use o **Modo navegador** (veja abaixo).
 
 ---
 
 ## Requisitos
 
-- Discord desktop com **BetterDiscord** atualizado (usa `BdApi.UI.buildSettingsPanel`, `BdApi.Net.fetch` e, se disponível, `BdApi.Commands`).
-- **Google Chrome ou Microsoft Edge como navegador padrão.** O Firefox não captura áudio do sistema. Se o seu padrão for outro, use **Configurações → Copiar link do transmissor** e abra no Chrome/Edge.
+- Discord desktop com o **BetterDiscord** atualizado.
 - Em **Configurações do Discord → Privacidade de atividade**, ative **"Compartilhar a sua atividade detectada com outras pessoas"**. Sem isso, o Rich Presence não aparece.
-- Upload suficiente: cada espectador recebe um stream P2P direto de você. Veja [Muitos espectadores](#muitos-espectadores).
+- Upload suficiente: cada espectador recebe uma conexão P2P direta sua.
 
 ## Instalação
 
 1. Baixe [`VDOShare.plugin.js`](./VDOShare.plugin.js).
-2. No Discord: **Configurações → BetterDiscord → Plugins → Abrir pasta de plugins** e coloque o arquivo lá.
-3. Ative o plugin **VDOShare**.
+2. **Configurações → BetterDiscord → Plugins → Abrir pasta de plugins** e coloque o arquivo lá.
+3. Ative o **VDOShare**.
 4. Configure o **Application ID** (próxima seção).
 
-### Criando o Application ID (necessário para o botão)
+> Se você usava a v1, basta substituir o arquivo. As configurações e o Stream ID são mantidos.
 
-O Discord só exibe botões de Rich Presence ligados a uma aplicação.
+### Application ID (necessário para o botão do Rich Presence)
 
 1. Acesse <https://discord.com/developers/applications> → **New Application**.
-2. Dê o nome que quiser (ex.: "Transmissão ao vivo") e crie.
-3. Copie o **Application ID** da página *General Information*.
-4. No plugin: **Configurações → Rich Presence → Application ID** e cole.
+2. Dê um nome (ex.: "Transmissão ao vivo") e crie.
+3. Copie o **Application ID** em *General Information*.
+4. Cole em **Configurações do plugin → Rich Presence → Application ID**.
 
-Não é preciso bot, token nem OAuth: só o ID.
+Não é preciso bot nem token.
 
 ---
 
 ## Uso
 
-1. Entre em um canal de voz (ou chamada) e clique em **Compartilhar Tela**.
-2. O navegador abre o VDO.Ninja com o seletor nativo. Escolha **tela inteira, janela ou aba** e marque **compartilhar áudio** se quiser.
-3. Pronto: o botão fica verde no Discord e o seu perfil mostra **"Assistir Transmissão"**. O link de visualização também é copiado para a área de transferência.
-4. Para encerrar, clique de novo em **Compartilhar Tela**. Fechar a aba do navegador também funciona: o Rich Presence some em até ~45 s.
+1. Entre em um canal de voz e clique em **Compartilhar Tela**, como sempre.
+2. Escolha a janela ou tela, a qualidade e se quer **som**, e clique em **Transmitir** (Go Live).
+3. O seu nome ganha o selo **AO VIVO**, o perfil mostra **"Assistir Transmissão"** e o link de visualização é copiado.
+4. Para encerrar, use **Parar transmissão** no Discord. Fechar a janela compartilhada também encerra a transmissão.
 
-Alternativas ao botão:
+**Sem canal de voz:** o comando **`/vdoshare`** abre um seletor do plugin (com opção de áudio no Windows) e transmite do mesmo jeito. Rode `/vdoshare` de novo para encerrar.
 
-- **Comando `/vdoshare`** no chat (BetterDiscord recente). Alterna a transmissão e mostra o link para você.
-- **Configurações do plugin → Alternar transmissão.**
+**Modo navegador:** em **Configurações → Ações → Navegador**, o plugin abre o VDO.Ninja no seu navegador padrão. Ali o seletor do Chrome/Edge permite compartilhar o **áudio de uma aba**. O encerramento usa o API remoto do VDO.Ninja (`&api=`), e o plugin percebe quando você fecha a aba.
 
-### Áudio do sistema: o que esperar
+### Quem assiste
 
-| Fonte escolhida | Windows (Chrome/Edge) | macOS (Chrome/Edge) | Linux |
-|---|---|---|---|
-| Aba do navegador | ✅ áudio da aba | ✅ áudio da aba | ✅ áudio da aba |
-| Tela inteira | ✅ áudio do sistema | depende da versão do sistema/navegador | depende do PipeWire/Pulse |
-| Janela | ❌ (limitação do navegador) | ❌ | ❌ |
-
-> Dica: para transmitir o áudio de um jogo ou app junto com a janela, escolha **Tela inteira** com "Compartilhar áudio do sistema".
+- O link abre direto no player do VDO.Ninja, em qualquer navegador moderno.
+- Antes de você escolher a fonte, aparece a mensagem de espera. O vídeo entra sozinho em seguida.
+- **Som:** o navegador pode exigir **um clique** no play antes de tocar vídeo com áudio. Nenhum parâmetro de URL contorna isso. Quem assiste sempre pode liberar `vdo.ninja` em `chrome://settings/content/sound`.
+- Outros usuários do Discord **não** veem a sua transmissão dentro do Discord. Eles assistem pelo botão "Assistir Transmissão".
+- Você não vê o botão do próprio Rich Presence (limitação do Discord), mas os outros veem.
 
 ---
 
@@ -118,59 +115,38 @@ Alternativas ao botão:
 
 | Seção | Opção | Padrão |
 |---|---|---|
-| Transmissão | ID fixo (link permanente) ou novo a cada transmissão | Fixo |
-| | Qualidade: 1080p / nativa / 720p / 360p | 1080p |
-| | FPS alvo | 60 |
-| | Tipo de conteúdo: movimento / detalhe / automático | Movimento |
-| | Áudio em alta qualidade (`&stereo`) | Ligado |
-| | Botão antes do seletor (`&screenshare2`) | Desligado |
-| | Meshcast (muitos espectadores) | Desligado |
-| | Parâmetros extras do transmissor | — |
-| Visualização | Bitrate solicitado (kbps) | 6000 |
-| | Codec preferido | Automático |
-| | Mensagem de espera | "A transmissão vai começar em instantes..." |
-| | Parâmetros extras do espectador | — |
-| Rich Presence | Ativar / Application ID / nome / tipo (Assistindo, Jogando…) / linhas / texto do botão / imagem | Assistindo |
-| Comportamento | Interceptar o botão do Discord | Ligado |
-| | Rótulos extras do botão (calibração) | — |
-| | Copiar link ao iniciar | Ligado |
-| | Detectar fim da transmissão | Ligado |
-| | URL do VDO.Ninja / da API (instância própria) | vdo.ninja |
-
----
-
-## Experiência de quem assiste
-
-- O link abre direto no player do VDO.Ninja. Não há sala, conta, instalação nem botão de "entrar".
-- Se a transmissão ainda não começou, aparece a mensagem de espera. O vídeo entra sozinho assim que você escolhe a tela.
-- **Autoplay com som:** navegadores podem bloquear vídeo **com áudio** até haver uma interação com a página. Quando isso acontece, o VDO.Ninja mostra um botão de play em tela cheia: **um clique** e pronto. Nenhum parâmetro de URL consegue contornar essa política do navegador. Quem assiste com frequência pode liberar o som permanentemente em `chrome://settings/content/sound`, adicionando `vdo.ninja` em "Permitido reproduzir som".
-- Você **não vê** o botão do seu próprio Rich Presence (comportamento do Discord), mas todos os outros veem. Para testar, peça para alguém ou use uma segunda conta.
-
-## Muitos espectadores
-
-Por ser P2P, cada espectador consome upload seu (≈ o bitrate pedido por espectador). Para mais do que alguns espectadores, ative **Meshcast**: você envia um único stream a um servidor do VDO.Ninja, que distribui para todos. A latência aumenta um pouco.
+| Ações | Transmitir/encerrar (escolher fonte), modo navegador, copiar link, gerar novo ID | — |
+| Transmissão | Usar o Go Live do Discord | Ligado |
+| | Resolução: seguir o seletor (mín. 1080p) / 720p / 1080p / 1440p / nativa | Seguir o seletor |
+| | FPS: seguir o seletor / 30 / 60 | Seguir o seletor |
+| | Bitrate máximo (kbps) | Automático |
+| | Manter imagem em telas paradas | Ligado |
+| | ID fixo ou novo a cada transmissão, Stream ID, rótulo | Fixo |
+| | Servidor de sinalização | Padrão do VDO.Ninja |
+| Link de visualização | `&stereo`, `&bitrate`, `&codec`, mensagem de espera, parâmetros extras | `&stereo` + mensagem |
+| Rich Presence | Ativar, Application ID, nome, tipo (Assistindo…), linhas, nº de espectadores, texto do botão, imagem, copiar link | Assistindo |
+| Modo navegador | Parâmetros extras do transmissor, URL da API | — |
 
 ## Privacidade e segurança
 
-- O **Stream ID** (12 caracteres aleatórios) funciona como a "senha" da transmissão: quem tem o link de visualização pode assistir. Com o ID fixo, o link continua o mesmo entre transmissões. Use **"Novo a cada transmissão"** ou **"Gerar novo ID e chave"** se quiser invalidar links antigos.
-- A **chave de API** fica só no link do transmissor, nunca no link de visualização. Não compartilhe o link do transmissor: quem tiver a chave pode encerrar a sua transmissão.
-- A mídia vai direto de você para quem assiste (WebRTC, criptografado). Os servidores do VDO.Ninja só fazem a sinalização, além do relay se você usar Meshcast ou se um TURN for necessário.
+- O **Stream ID** (12 caracteres aleatórios) é o que dá acesso à transmissão: quem tem o link pode assistir. Use **"Novo a cada transmissão"** ou **"Gerar novo ID"** para invalidar links antigos.
+- A mídia vai de você direto para quem assiste, criptografada pelo WebRTC. Os servidores do VDO.Ninja fazem só a sinalização, e um relay TURN quando a conexão direta não é possível.
+- O SDK é baixado em uma versão fixa e conferido por hash antes de ser executado.
 
 ## Solução de problemas
 
 | Problema | Solução |
 |---|---|
-| Clicar em "Compartilhar Tela" abre o Go Live do Discord | O rótulo do botão não foi reconhecido (idioma ou layout novo). Use **Configurações → Calibrar** e clique no botão. Ou adicione o `aria-label` em **Rótulos extras**. |
-| O botão "Assistir Transmissão" não aparece para os outros | Confira o **Application ID** e a opção de compartilhar atividade nas configurações de privacidade do Discord. |
-| O navegador não abre o seletor de tela | Ative **"Mostrar botão antes do seletor"** (`&screenshare2`). |
-| Sem áudio | Escolha **Tela inteira** ou **Aba** e marque compartilhar áudio. Use Chrome/Edge. Não adicione `&noaudio`. |
-| Qualidade baixa / travando | Diminua a qualidade para 720p ou o FPS, reduza o bitrate do espectador ou ative Meshcast. |
-| Rich Presence ficou preso | Clique em **Alternar transmissão** nas configurações ou desative e reative o plugin. |
+| O botão "Compartilhar Tela" continua travado | Veja o status em **Configurações → Ações**. Uma atualização do Discord pode ter mudado o experimento ou os módulos: use `/vdoshare` enquanto isso e abra uma issue com o erro do console (Ctrl+Shift+I). |
+| "não foi possível carregar o SDK" | O jsDelivr e o unpkg estão inacessíveis na sua rede ou o arquivo mudou. Tente de novo mais tarde. |
+| Tela preta para quem assiste | Aguarde alguns segundos. Confirme que "Manter imagem em telas paradas" está ligado. |
+| Sem som | Só o Windows captura áudio no Discord. No macOS e no Linux, use o Modo navegador com uma aba. |
+| O botão "Assistir Transmissão" não aparece para os outros | Confira o **Application ID** e a opção de compartilhar atividade. |
+| Travando ou com baixa qualidade | Reduza a resolução, o FPS ou o bitrate máximo. Cada espectador consome upload. |
+| Quero o Go Live normal do Discord | Desative **"Usar o Go Live do Discord"** ou o plugin. |
 
-## Referências
+## Créditos
 
-- [VDO.Ninja: screen-share parameters](https://docs.vdo.ninja/advanced-settings/screen-share-parameters)
-- [VDO.Ninja: HTTP/WSS API](https://docs.vdo.ninja/advanced-settings/api-and-midi-parameters/api/api-reference)
-- [VDO.Ninja: autoplay](https://docs.vdo.ninja/common-errors-and-known-issues/autoplay-doesnt-work-in-chrome-or-vmix-v77)
-- [VDO.Ninja: Meshcast](https://docs.vdo.ninja/advanced-settings/meshcast-parameters/and-meshcast)
-- [BetterDiscord: documentação de plugins](https://docs.betterdiscord.app/plugins)
+- Ponte do Go Live nativo adaptada de [ADCDS/discord-byo-stream](https://github.com/ADCDS/discord-byo-stream) (MIT; veja [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)).
+- [VDO.Ninja](https://vdo.ninja) e o [SDK do VDO.Ninja](https://github.com/steveseguin/ninjasdk), de Steve Seguin (MPL-2.0).
+- Rich Presence local inspirado no plugin CustomRPC do Vencord.
