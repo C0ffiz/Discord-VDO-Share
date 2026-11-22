@@ -1,5 +1,13 @@
 # Third-party notices
 
+## YABDP4Nitro
+
+The Go Live quality unlock in `VDOShare.plugin.js` is derived from YABDP4Nitro
+(<https://github.com/riolubruh/YABDP4Nitro>), Copyright (c) 2025 Riolubruh and
+contributors, licensed under the Open Software License 3.0. Because of that, this
+project is licensed under OSL-3.0 as well (see `LICENSE.md`), and YABDP4Nitro's
+attribution notice is kept verbatim at the top of `VDOShare.plugin.js`.
+
 ## ADCDS/discord-byo-stream
 
 Parts of `VDOShare.plugin.js` (the native Go Live bridge in `GoLiveBridge` and the `keepAlive` frame helper) are adapted from <https://github.com/ADCDS/discord-byo-stream> (`plugin/src/native.js`, `plugin/src/keepalive.js`, `plugin/src/discord.js`).

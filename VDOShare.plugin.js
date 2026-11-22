@@ -3,17 +3,47 @@
  * @author C0ffiz
  * @authorLink https://github.com/C0ffiz
  * @description Reativa o Go Live nativo do Discord ("Compartilhar Tela") e transmite a tela direto do Discord via VDO.Ninja (P2P), com um Rich Presence "Assistir Transmissão" para quem quiser assistir no navegador.
- * @version 2.1.0
+ * @version 2.2.0
  * @source https://github.com/C0ffiz/Discord-VDO-Share
  * @website https://github.com/C0ffiz/Discord-VDO-Share
  * @updateUrl https://raw.githubusercontent.com/C0ffiz/Discord-VDO-Share/main/VDOShare.plugin.js
  */
 
-"use strict";
+/*
+ * VDOShare
+ * Copyright (c) 2026 C0ffiz and contributors
+ *
+ * Licensed under the Open Software License version 3.0 (OSL-3.0). See LICENSE.md.
+ *
+ * Contains work derived from YABDP4Nitro (stream quality unlock), whose license
+ * notice follows and must be kept, and from ADCDS/discord-byo-stream (GoLiveBridge,
+ * keepAlive), Copyright (c) 2026 Adriel Santos, MIT License (see THIRD_PARTY_NOTICES.md).
+ */
 
-// Parts of this file (GoLiveBridge, keepAlive) are adapted from
-// https://github.com/ADCDS/discord-byo-stream, Copyright (c) 2026 Adriel Santos,
-// MIT License. See THIRD_PARTY_NOTICES.md for the full notice.
+/*    ***** ATTRIBUTION NOTICE *****
+ *
+ * YABDP4Nitro is a free BetterDiscord plugin that bypasses and unlocks Nitro-locked features in the Discord client.
+ *
+ * Copyright (c) 2025 Riolubruh and contributors
+ *
+ * Licensed under the Open Software License version 3.0 (OSL-3.0).
+ * You may use, distribute, and modify this code under the terms of this license.
+ *
+ * Derivative works must be licensed under OSL-3.0.
+ *
+ * Removal or modification of this notice in the source code of any Derivative Work
+ * of this software violates the terms of the license.
+ *
+ * This software is provided on an "AS IS" BASIS and WITHOUT WARRANTY, either express or implied,
+ * including, without limitation, the warranties of non-infringement, merchantability or fitness for a particular purpose.
+ * THE ENTIRE RISK AS TO THE QUALITY OF THIS SOFTWARE IS WITH YOU.
+ *
+ * You should have received a copy of the license agreement alongside this file.
+ * If not, please visit https://opensource.org/license/osl-3-0-php
+ *
+*/
+
+"use strict";
 
 /* ========================================================================== *
  *  Constants
@@ -48,15 +78,15 @@ const CODEC_OPTIONS = [
     {label: "VP8", value: "vp8"}
 ];
 
-const QUALITY_PRESETS = [
-    {label: "4K 60", values: {customHeight: 2160, customFps: 60, maxBitrate: 20000}},
-    {label: "1440p 60", values: {customHeight: 1440, customFps: 60, maxBitrate: 12000}},
-    {label: "1080p 120", values: {customHeight: 1080, customFps: 120, maxBitrate: 12000}},
-    {label: "1080p 60", values: {customHeight: 1080, customFps: 60, maxBitrate: 8000}},
-    {label: "720p 60", values: {customHeight: 720, customFps: 60, maxBitrate: 4500}},
-    {label: "Texto (1440p 15)", values: {customHeight: 1440, customFps: 15, maxBitrate: 4000}},
-    {label: "Nativa 60", values: {customHeight: 0, customFps: 60, maxBitrate: 0}}
-];
+// Discord's Go Live quality values (resolution 0 = "Source"). The extra values
+// below are added to Discord's own menus; they work because the media goes
+// through VDO.Ninja, not Discord's servers.
+const PRESET_CUSTOM = 3;
+const RESOLUTION_OPTIONS = [480, 720, 1080, 1440, 2160, 0];
+const EXTRA_RESOLUTIONS = [2160];
+const FPS_OPTIONS = [5, 15, 30, 60, 90, 120, 144, 240];
+const EXTRA_FPS = [90, 120, 144, 240];
+const BITRATE_OPTIONS = [0, 2500, 4000, 6000, 8000, 12000, 20000, 30000];
 const INSTALL_GIVE_UP_MS = 60000;
 
 const DEFAULTS = {
@@ -64,10 +94,7 @@ const DEFAULTS = {
     idMode: "fixed",            // "fixed" | "session"
     streamId: "",
     apiKey: "",                 // only used by the browser fallback (&api remote control)
-    unlockQuality: true,        // unlock every resolution/FPS in Discord's Go Live picker
-    customQuality: false,       // override the picker with the values below
-    customHeight: 1080,         // px, 0 = source (native)
-    customFps: 60,
+    unlockQuality: true,        // unlock Nitro-only stream quality options everywhere in Discord
     maxBitrate: 0,              // kbps, 0 = automatic
     minBitrate: 0,              // kbps, 0 = none
     audioBitrate: 0,            // kbps, 0 = SDK default
@@ -485,7 +512,8 @@ class GoLiveBridge {
             sourceId,
             sourceName,
             sound: Boolean(settings.desktopSettings.sound),
-            resolution: settings.qualityOptions?.resolution ?? 1080,
+            preset: settings.qualityOptions?.preset ?? PRESET_CUSTOM,
+            resolution: settings.qualityOptions?.resolution ?? 720,
             fps: settings.qualityOptions?.frameRate ?? 30
         };
         // Discord re-sends the same source right after a stream starts.
@@ -685,8 +713,9 @@ module.exports = class VDOShare {
         this.api.DOM.addStyle("vdoshare-css", PICKER_CSS);
         this.registerCommand();
         this.startedAt = Date.now();
-        this.qualityUnlock = {validator: false, check: false};
+        this.qualityUnlock = {validator: false};
         this.abort = new AbortController();
+        this.goLiveModal = null;
         this.tryInstallBridge();
         this.patchGoLiveModal();
         this.loadSdk().catch(error => this.api.Logger.warn("SDK preload failed", error));
@@ -699,6 +728,7 @@ module.exports = class VDOShare {
         this.bridge?.uninstall();
         this.bridge = null;
         this.endShare({silent: true});
+        this.restoreQualityLists();
         this.clearPresence();
         this.api.Patcher.unpatchAll();
         this.api.DOM.removeStyle("vdoshare-css");
@@ -709,19 +739,31 @@ module.exports = class VDOShare {
         this.api.Data.save("settings", this.settings);
     }
 
-    // v2.0 stored "quality"/"fps" dropdowns; map them onto the custom quality fields.
+    // v2.0 stored "quality"/"fps"; v2.1 stored customQuality/customHeight/customFps.
+    // Resolution/FPS now live in Discord's own Go Live settings, so the old values
+    // are handed to Discord once the store is available (see installDiscordIntegration).
     migrateSettings() {
         const s = this.settings;
-        if (!("quality" in s) && !("fps" in s)) return false;
-        const height = {"720": 720, "1080": 1080, "1440": 1440, native: 0}[s.quality];
-        if (height !== undefined || Number(s.fps) > 0) {
-            s.customQuality = true;
-            if (height !== undefined) s.customHeight = height;
-            if (Number(s.fps) > 0) s.customFps = Number(s.fps);
+        let changed = false;
+        if ("quality" in s || "fps" in s) {
+            const height = {"720": 720, "1080": 1080, "1440": 1440, native: 0}[s.quality];
+            if (height !== undefined || Number(s.fps) > 0) {
+                s.customQuality = true;
+                if (height !== undefined) s.customHeight = height;
+                if (Number(s.fps) > 0) s.customFps = Number(s.fps);
+            }
+            delete s.quality;
+            delete s.fps;
+            changed = true;
         }
-        delete s.quality;
-        delete s.fps;
-        return true;
+        if ("customQuality" in s || "customHeight" in s || "customFps" in s) {
+            if (s.customQuality) this.pendingQualityMigration = {resolution: Number(s.customHeight) || 0, fps: Number(s.customFps) || 30};
+            delete s.customQuality;
+            delete s.customHeight;
+            delete s.customFps;
+            changed = true;
+        }
+        return changed;
     }
 
     tryInstallBridge() {
@@ -731,6 +773,7 @@ module.exports = class VDOShare {
             bridge.install();
             this.bridge = bridge;
             this.bridgeError = null;
+            this.installDiscordIntegration();
         }
         catch (error) {
             this.bridgeError = error.message;
@@ -766,34 +809,346 @@ module.exports = class VDOShare {
     }
 
     /**
-     * Makes every resolution/FPS in Discord's Go Live picker selectable without
-     * Nitro, by overriding the client-side checks the picker asks. (Same targets
-     * YABDP4Nitro documents: the "canStreamWithSettings" validator and the
-     * preset/resolution/fps permission check.) Safe to call repeatedly.
+     * Lets every resolution/FPS combination pass Discord's client-side
+     * "canStreamWithSettings" validator (used by the Go Live modal, the stream
+     * start and the live stream menu). Same target YABDP4Nitro patches.
      */
     installQualityUnlock() {
-        const P = this.api.Patcher;
-        const allow = (_, args, original) => (this.settings.unlockQuality ? true : original(...args));
-        if (!this.qualityUnlock.validator) {
-            const target = this.findFunctionPatchTarget(["canStreamWithSettings"], code => code.includes("canStreamWithSettings"));
-            if (target) {
-                P.instead(target[0], target[1], allow);
-                this.qualityUnlock.validator = true;
-            }
+        if (this.qualityUnlock.validator) return;
+        const target = this.findFunctionPatchTarget(["canStreamWithSettings"], code => code.includes("canStreamWithSettings"));
+        if (!target) return;
+        this.api.Patcher.instead(target[0], target[1], (_, args, original) => (this.settings.unlockQuality ? true : original(...args)));
+        this.qualityUnlock.validator = true;
+    }
+
+    /* ---------------- Discord integration: one source of truth ---------------- */
+
+    /**
+     * Discord's ApplicationStreamingSettingsStore (preset/resolution/fps/sound) is
+     * the single source of truth for stream quality. VDOShare reads it, applies it
+     * and writes back whatever it actually uses, so the Go Live modal, its gear
+     * menu, the live stream menu and the rest of Discord all show the same thing.
+     */
+    installDiscordIntegration() {
+        const W = this.api.Webpack;
+        this.StreamSettingsStore = W.getStore?.("ApplicationStreamingSettingsStore")
+            ?? W.getModule(m => m?._dispatchToken && m.getName?.() === "ApplicationStreamingSettingsStore", {searchExports: true});
+        this.MediaEngineStore = this.bridge?.mediaEngine;
+
+        // While our stream is live, report it as the Go Live source so Discord's
+        // live stream menu (quality, sound) can act on it.
+        if (this.MediaEngineStore?.getGoLiveSource) {
+            this.api.Patcher.instead(this.MediaEngineStore, "getGoLiveSource", (_, args, original) => {
+                const share = this.share;
+                if (share?.mode !== "native" || !share.source || !this.settings.takeOverGoLive) return original(...args);
+                return {
+                    desktopSource: {id: share.source.sourceId, sourcePid: null, soundshareId: null, soundshareSession: null},
+                    quality: {resolution: share.source.resolution, frameRate: share.source.fps}
+                };
+            });
         }
-        if (!this.qualityUnlock.check) {
-            const target = this.findFunctionPatchTarget(["preset)&&", "resolution&&", "fps&&"], code => code.includes("fps"));
-            if (target) {
-                P.instead(target[0], target[1], allow);
-                this.qualityUnlock.check = true;
-            }
+
+        this.extendQualityLists();
+        this.patchMenus();
+
+        if (this.pendingQualityMigration) {
+            const {resolution, fps} = this.pendingQualityMigration;
+            this.pendingQualityMigration = null;
+            this.writeDiscordQuality({preset: PRESET_CUSTOM, resolution, fps});
         }
     }
 
-    /** Adds a "VDOShare" quality button to the footer of Discord's Go Live modal. Best effort. */
+    /** Discord's current Go Live quality settings. */
+    getDiscordQuality() {
+        const state = this.StreamSettingsStore?.getState?.() ?? {};
+        return {
+            preset: state.preset ?? PRESET_CUSTOM,
+            resolution: state.resolution ?? 720,
+            fps: state.fps ?? 30,
+            sound: state.soundshareEnabled ?? true
+        };
+    }
+
+    /** Writes quality into Discord's store (and refreshes anything showing the Go Live source). */
+    writeDiscordQuality({preset, resolution, fps, sound}) {
+        if (!this.Dispatcher) return;
+        const action = {type: "STREAM_UPDATE_SETTINGS", preset: preset ?? PRESET_CUSTOM, resolution, frameRate: fps};
+        if (typeof sound === "boolean") action.soundshareEnabled = sound;
+        try { this.Dispatcher.dispatch(action); }
+        catch (error) { this.api.Logger.warn("STREAM_UPDATE_SETTINGS failed", error); }
+        try { this.MediaEngineStore?.emitChange?.(); } catch (_) { /* ignore */ }
+    }
+
+    /** Asks for a quality change the same way Discord's own live stream menu does. */
+    requestLiveQuality({resolution, fps}) {
+        const share = this.share;
+        if (share?.mode === "native" && this.bridge) {
+            this.bridge.onGoLiveSource({settings: {
+                context: STREAM_CONTEXT,
+                desktopSettings: {sourceId: share.source.sourceId, sound: Boolean(share.source.sound)},
+                qualityOptions: {preset: PRESET_CUSTOM, resolution: resolution ?? share.source.resolution, frameRate: fps ?? share.source.fps}
+            }});
+        }
+        else if (share?.source) {
+            this.switchSource({...share.source, preset: PRESET_CUSTOM, resolution: resolution ?? share.source.resolution, fps: fps ?? share.source.fps})
+                .catch(error => this.api.UI.showToast(`VDOShare: ${error.message}`, {type: "error"}));
+        }
+        else {
+            const current = this.getDiscordQuality();
+            this.writeDiscordQuality({...current, preset: PRESET_CUSTOM, resolution: resolution ?? current.resolution, fps: fps ?? current.fps});
+        }
+    }
+
+    /**
+     * Adds 4K and high frame rates to the option lists Discord's live stream menu
+     * builds from (exported arrays of the stream constants module). Undone on stop.
+     */
+    extendQualityLists() {
+        if (this.qualityListsPatched) return;
+        const W = this.api.Webpack;
+        const constants = W.getModule(m => Array.isArray(m?.Jk) && Array.isArray(m?.ce) && Array.isArray(m?.ZV), {searchExports: false})
+            ?? W.getModule(m => {
+                const arrays = Object.values(m ?? {}).filter(Array.isArray);
+                return arrays.some(a => a.length && a.every(o => o && typeof o === "object" && "value" in o) && a.some(o => o.value === 1440))
+                    && arrays.some(a => a.length && a.every(o => o && typeof o === "object" && "value" in o) && a.some(o => o.value === 60) && a.every(o => o.value <= 60));
+            });
+        if (!constants) return this.api.Logger.warn("stream quality option lists not found");
+        const arrays = Object.values(constants).filter(Array.isArray);
+        const isOptionList = (a) => a.length && a.every(o => o && typeof o === "object" && "value" in o);
+        const resolutions = arrays.find(a => isOptionList(a) && a.some(o => o.value === 1440));
+        const framerates = arrays.find(a => isOptionList(a) && a.some(o => o.value === 60) && !a.some(o => o.value === 1440));
+        if (!resolutions || !framerates) return;
+
+        const added = [];
+        const sample60 = framerates.find(o => o.value === 60);
+        for (const value of EXTRA_RESOLUTIONS) {
+            if (resolutions.some(o => o.value === value)) continue;
+            const item = {value, label: value === 2160 ? "4K (2160p)" : `${value}p`, subtext: undefined, __vdoshare: true};
+            const sourceIndex = resolutions.findIndex(o => o.value === 0);
+            resolutions.splice(sourceIndex >= 0 ? sourceIndex : resolutions.length, 0, item);
+            added.push([resolutions, item]);
+        }
+        for (const value of EXTRA_FPS) {
+            if (framerates.some(o => o.value === value)) continue;
+            const base = String(sample60?.label ?? "60 FPS");
+            const item = {value, label: base.includes("60") ? base.replace("60", String(value)) : `${value} FPS`, subtext: undefined, __vdoshare: true};
+            framerates.push(item);
+            added.push([framerates, item]);
+        }
+        this.qualityListsPatched = added;
+    }
+
+    restoreQualityLists() {
+        for (const [list, item] of this.qualityListsPatched || []) {
+            const index = list.indexOf(item);
+            if (index >= 0) list.splice(index, 1);
+        }
+        this.qualityListsPatched = null;
+    }
+
+    /**
+     * Discord renders the Go Live gear menu ("stream-options") and the live stream
+     * menu ("manage-streams") as popouts, which BdApi.ContextMenu.patch doesn't
+     * reach, so this patches the shared Menu component and filters by navId.
+     */
+    patchMenus() {
+        if (this.menusPatched) return;
+        const W = this.api.Webpack;
+        const Menu = BdApi.ContextMenu?.Menu;
+        let target = null;
+        const mod = W.getModule(W.Filters.bySource("UPDATE_ITEMS", "SET_FOCUS_PATH"));
+        if (mod) {
+            const key = Object.keys(mod).find(k => { try { return mod[k] === Menu; } catch (_) { return false; } })
+                ?? Object.keys(mod).find(k => { try { return typeof mod[k] === "function" && Function.prototype.toString.call(mod[k]).includes("navId"); } catch (_) { return false; } });
+            if (key) target = [mod, key];
+        }
+        if (!target && Menu) {
+            const owner = W.getModule(m => { try { return Object.values(m ?? {}).includes(Menu); } catch (_) { return false; } });
+            const key = owner && Object.keys(owner).find(k => owner[k] === Menu);
+            if (key) target = [owner, key];
+        }
+        if (!target) return this.api.Logger.warn("Menu component not found; Go Live menus not extended");
+
+        this.api.Patcher.before(target[0], target[1], (_, args) => {
+            const props = args[0];
+            if (!props?.navId) return;
+            try {
+                if (props.navId === "stream-options") args[0] = {...props, children: this.transformGoLiveMenu(props.children)};
+                else if (props.navId === "manage-streams") args[0] = {...props, children: this.transformManageStreamsMenu(props.children)};
+            }
+            catch (error) {
+                this.api.Logger.warn(`menu patch (${props.navId}) failed`, error);
+            }
+        });
+        this.menusPatched = true;
+    }
+
+    menuItem(kind, props) {
+        const CM = BdApi.ContextMenu;
+        const component = {item: CM.Item, radio: CM.RadioItem, checkbox: CM.CheckboxItem, group: CM.Group, separator: CM.Separator}[kind];
+        return BdApi.React.createElement(component, props);
+    }
+
+    /** Maps a menu children tree, replacing elements whose props.id is in `replacers`. */
+    mapMenuTree(node, replacers) {
+        const {React} = BdApi;
+        if (Array.isArray(node)) return node.map(child => this.mapMenuTree(child, replacers));
+        if (!React.isValidElement(node)) return node;
+        const id = node.props?.id;
+        if (id && replacers[id]) return replacers[id](node);
+        const children = node.props?.children;
+        if (children && (Array.isArray(children) || React.isValidElement(children))) {
+            return React.cloneElement(node, {}, ...[].concat(this.mapMenuTree(children, replacers)));
+        }
+        return node;
+    }
+
+    resolutionLabel(value, sourceLabel) {
+        if (value === 0) return sourceLabel || "Fonte";
+        return value === 2160 ? "4K (2160p)" : `${value}p`;
+    }
+
+    /** Go Live modal gear menu: full resolution/FPS lists without Nitro locks, plus a VDOShare submenu. */
+    transformGoLiveMenu(children) {
+        const modal = this.goLiveModal;
+        const unlocked = this.settings.unlockQuality;
+        if (!modal?.dispatch) return children;
+        const state = modal.state ?? {};
+        const findSourceLabel = (node) => {
+            const items = [].concat(node.props?.children ?? []);
+            const source = items.find(c => c?.props?.id === "stream-option-resolution-0");
+            const label = source?.props?.label ?? source?.props?.void_label?.props?.label ?? source?.props?.void_label;
+            return typeof label === "string" ? label : null;
+        };
+        const replacers = unlocked ? {
+            "resolution": (node) => {
+                const sourceLabel = findSourceLabel(node);
+                const allowSource = [].concat(node.props.children ?? []).some(c => c?.props?.id === "stream-option-resolution-0");
+                return BdApi.React.cloneElement(node, {}, ...RESOLUTION_OPTIONS.filter(v => v !== 0 || allowSource).map(value => this.menuItem("radio", {
+                    group: "resolution",
+                    id: `stream-option-resolution-${value}`,
+                    label: this.resolutionLabel(value, sourceLabel),
+                    checked: state.resolution === value,
+                    action: () => modal.dispatch({type: "set_resolution", resolution: value})
+                })));
+            },
+            "frame-rate": (node) => BdApi.React.cloneElement(node, {}, ...FPS_OPTIONS.map(value => this.menuItem("radio", {
+                group: "frame-rate",
+                id: `stream-option-frame-rate-${value}`,
+                label: `${value}fps`,
+                checked: state.fps === value,
+                action: () => modal.dispatch({type: "set_fps", fps: value})
+            })))
+        } : {};
+        const mapped = [].concat(this.mapMenuTree(children, replacers));
+        const preview = this.resolvePreset({resolution: state.resolution, fps: state.fps});
+        return [...mapped, this.menuItem("separator", {}), this.vdoShareSubmenu("stream-option", preview)];
+    }
+
+    /** Live stream menu: add the VDOShare submenu inside Discord's "Stream settings". */
+    transformManageStreamsMenu(children) {
+        const share = this.share;
+        if (share?.mode !== "native" || !share.preset) return children;
+        return [].concat(this.mapMenuTree(children, {
+            "stream-settings": (node) => BdApi.React.cloneElement(node, {}, ...[].concat(node.props.children ?? []),
+                this.menuItem("separator", {}), this.vdoShareSubmenu("stream-settings", share.preset))
+        }));
+    }
+
+    /** VDOShare-only options (bitrate, codec, link) shown inside Discord's menus. */
+    vdoShareSubmenu(prefix, preset) {
+        const s = this.settings;
+        const autoKbps = this.resolvePreset({resolution: preset?.resolution ?? 720, fps: preset?.frameRate ?? 30}, {ignoreOverrides: true}).maxBitrateKbps;
+        const mbps = (kbps) => `${(kbps / 1000).toLocaleString("pt-BR", {maximumFractionDigits: 1})} Mbps`;
+        const currentBitrate = Number(s.maxBitrate) > 0 ? mbps(Number(s.maxBitrate)) : `Automático (${mbps(autoKbps)})`;
+        const currentCodec = CODEC_OPTIONS.find(o => o.value === (s.videoCodec || ""))?.label ?? "Automático";
+        return this.menuItem("item", {
+            id: `${prefix}-vdoshare`,
+            label: "VDOShare",
+            subtext: `${currentBitrate} · ${currentCodec.split(" (")[0]}`,
+            children: [
+                this.menuItem("item", {
+                    id: `${prefix}-vdoshare-bitrate`,
+                    label: "Bitrate máximo",
+                    subtext: currentBitrate,
+                    children: BITRATE_OPTIONS.map(value => this.menuItem("radio", {
+                        group: `${prefix}-vdoshare-bitrate`,
+                        id: `${prefix}-vdoshare-bitrate-${value}`,
+                        label: value ? mbps(value) : `Automático (${mbps(autoKbps)})`,
+                        checked: (Number(s.maxBitrate) || 0) === value,
+                        action: () => this.setVdoShareSetting("maxBitrate", value)
+                    }))
+                }),
+                this.menuItem("item", {
+                    id: `${prefix}-vdoshare-codec`,
+                    label: "Codec de vídeo",
+                    subtext: currentCodec,
+                    children: CODEC_OPTIONS.map(option => this.menuItem("radio", {
+                        group: `${prefix}-vdoshare-codec`,
+                        id: `${prefix}-vdoshare-codec-${option.value || "auto"}`,
+                        label: option.label,
+                        checked: (s.videoCodec || "") === option.value,
+                        action: () => this.setVdoShareSetting("videoCodec", option.value)
+                    }))
+                }),
+                this.menuItem("separator", {}),
+                this.menuItem("item", {
+                    id: `${prefix}-vdoshare-copy`,
+                    label: "Copiar link de visualização",
+                    action: () => { this.copy(this.share?.viewerUrl || this.buildViewerUrl(sanitizeId(s.streamId))); this.api.UI.showToast("Link copiado!", {type: "success"}); }
+                }),
+                this.menuItem("item", {
+                    id: `${prefix}-vdoshare-more`,
+                    label: "Mais opções de qualidade…",
+                    action: () => this.openQualityModal()
+                })
+            ]
+        });
+    }
+
+    setVdoShareSetting(key, value) {
+        this.settings[key] = value;
+        this.saveSettings();
+        if (this.share?.vdo) this.applyQualityLive();
+    }
+
+    /**
+     * Go Live modal: remembers its state/dispatch (so the gear menu can offer the
+     * extra resolutions/FPS) and, with the unlock on, removes the Nitro-only SD/HD
+     * toggle and the "Get Nitro" banner from the footer.
+     */
     patchGoLiveModal() {
         const W = this.api.Webpack;
-        const {React} = BdApi;
+        const sourceCache = new WeakMap();
+        const sourceOf = (fn) => {
+            if (typeof fn !== "function") return "";
+            if (!sourceCache.has(fn)) {
+                let code = "";
+                try { code = Function.prototype.toString.call(fn); } catch (_) { /* ignore */ }
+                sourceCache.set(fn, code);
+            }
+            return sourceCache.get(fn);
+        };
+        const isNitroLock = (el) => {
+            const code = sourceOf(el?.type);
+            return /value:\s*["']hd["']/.test(code) || code.includes("PREMIUM_WISHLIST_STREAM_UPSELL");
+        };
+        const prune = (node) => {
+            if (Array.isArray(node)) {
+                return node.filter(child => {
+                    if (isNitroLock(child)) return false;
+                    const only = child?.props?.children;
+                    return !(typeof child?.type === "string" && !Array.isArray(only) && isNitroLock(only));
+                }).map(prune);
+            }
+            const props = node?.props;
+            if (props && props.children !== undefined && typeof props.children !== "function") {
+                if (typeof node.type === "string" && isNitroLock(props.children)) props.children = null;
+                else props.children = prune(props.children);
+            }
+            return node;
+        };
+
         W.waitForModule(W.Filters.bySource(GO_LIVE_MODAL_SOURCE), {signal: this.abort.signal})
             .then((mod) => {
                 if (!mod || this.abort.signal.aborted) return;
@@ -802,21 +1157,12 @@ module.exports = class VDOShare {
                 if (!key) return this.api.Logger.warn("Go Live modal: no component export found");
                 this.api.Patcher.after(mod, key, (_, __, ret) => {
                     try {
-                        const footer = this.api.Utils.findInTree(ret, (node) => typeof node?.className === "string"
-                            && /(^|\s|_)footer/i.test(node.className) && node.children !== undefined, {walkable: ["props", "children"]});
-                        if (!footer) return ret;
-                        const children = Array.isArray(footer.children) ? footer.children : [footer.children];
-                        if (children.some(c => c?.key === "vdoshare-quality")) return ret;
-                        footer.children = [...children, React.createElement("button", {
-                            key: "vdoshare-quality",
-                            type: "button",
-                            className: "vdoshare-golive-btn",
-                            title: "Qualidade VDOShare: resolução, FPS e bitrate personalizados",
-                            onClick: (event) => { event.preventDefault(); event.stopPropagation(); this.openQualityModal(); }
-                        }, "⚙ VDOShare")];
+                        // The modal returns <Provider state dispatch>…</Provider>.
+                        if (typeof ret?.props?.dispatch === "function") this.goLiveModal = {state: ret.props.state, dispatch: ret.props.dispatch};
+                        if (this.settings.unlockQuality) prune(ret);
                     }
                     catch (error) {
-                        this.api.Logger.warn("Go Live modal footer patch failed", error);
+                        this.api.Logger.warn("Go Live modal patch failed", error);
                     }
                     return ret;
                 });
@@ -824,63 +1170,70 @@ module.exports = class VDOShare {
             .catch((error) => { if (!this.abort.signal.aborted) this.api.Logger.warn("Go Live modal not found", error); });
     }
 
-    /** Quick quality dialog (Go Live footer button, /vdoshare-qualidade, settings). */
+    /**
+     * "Mais opções de qualidade…": resolution/FPS are read from and written to
+     * Discord's own Go Live settings; bitrate/codec are VDOShare's. Applies live.
+     */
     openQualityModal() {
         const {React} = BdApi;
         const {createElement: h} = React;
         const s = this.settings;
-        const fields = ["customQuality", "customHeight", "customFps", "maxBitrate", "minBitrate", "audioBitrate", "videoCodec"];
-        const draft = Object.fromEntries(fields.map(k => [k, s[k]]));
-        const item = (setting, version) => h(React.Fragment, {key: `${setting.id}-${version}`},
-            this.api.UI.buildSettingItem({...setting, value: draft[setting.id], onChange: (v) => { draft[setting.id] = setting.type === "number" ? Number(v) : v; }}));
-
-        const Content = () => {
-            const [version, setVersion] = React.useState(0);
-            const applyPreset = (values) => { Object.assign(draft, values, {customQuality: true}); setVersion(v => v + 1); };
-            return h("div", {className: "vdoshare-quality"},
-                h("div", {className: "vdoshare-quality-presets"},
-                    QUALITY_PRESETS.map(p => h("button", {key: p.label, type: "button", className: "vdoshare-preset", onClick: () => applyPreset(p.values)}, p.label)),
-                    h("button", {key: "auto", type: "button", className: "vdoshare-preset", onClick: () => { draft.customQuality = false; setVersion(v => v + 1); }}, "Seguir o Discord")),
-                item({type: "switch", id: "customQuality", name: "Usar qualidade personalizada", note: "Desligado: usa a resolução/FPS escolhidos no seletor do Discord."}, version),
-                item({type: "number", id: "customHeight", name: "Resolução (altura em px)", note: "0 = nativa. Ex.: 720, 1080, 1440, 2160.", min: 0, max: 4320}, version),
-                item({type: "number", id: "customFps", name: "FPS", note: "1–240", min: 1, max: 240}, version),
-                item({type: "number", id: "maxBitrate", name: "Bitrate máximo (kbps)", note: "0 = automático pela resolução/FPS.", min: 0, max: 100000}, version),
-                item({type: "number", id: "minBitrate", name: "Bitrate mínimo (kbps)", note: "0 = sem mínimo. Nem todo navegador respeita.", min: 0, max: 100000}, version),
-                item({type: "number", id: "audioBitrate", name: "Bitrate do áudio (kbps)", note: "0 = padrão.", min: 0, max: 510}, version),
-                item({type: "dropdown", id: "videoCodec", name: "Codec de vídeo", note: "Preferência do transmissor.", options: CODEC_OPTIONS}, version));
+        const live = this.share?.source;
+        const current = live ? {resolution: live.resolution, fps: live.fps} : this.getDiscordQuality();
+        const draft = {
+            resolution: current.resolution,
+            fps: current.fps,
+            maxBitrate: Number(s.maxBitrate) || 0,
+            minBitrate: Number(s.minBitrate) || 0,
+            audioBitrate: Number(s.audioBitrate) || 0,
+            videoCodec: s.videoCodec || ""
         };
+        const options = (values, label) => {
+            const list = values.map(v => ({label: label(v), value: v}));
+            return list;
+        };
+        const resolutions = options(RESOLUTION_OPTIONS.includes(draft.resolution) ? RESOLUTION_OPTIONS : [...RESOLUTION_OPTIONS, draft.resolution], v => this.resolutionLabel(v, "Fonte (nativa)"));
+        const framerates = options(FPS_OPTIONS.includes(draft.fps) ? FPS_OPTIONS : [...FPS_OPTIONS, draft.fps].sort((a, b) => a - b), v => `${v} fps`);
+        const item = (setting) => h(React.Fragment, {key: setting.id},
+            this.api.UI.buildSettingItem({...setting, value: draft[setting.id], onChange: (v) => { draft[setting.id] = setting.type === "number" || typeof draft[setting.id] === "number" ? Number(v) : v; }}));
 
-        this.api.UI.showConfirmationModal("Qualidade da transmissão", h(Content), {
+        const content = h("div", {className: "vdoshare-quality"},
+            h("div", {className: "vdoshare-quality-note"}, live
+                ? "Aplica na transmissão ao vivo, sem precisar compartilhar de novo."
+                : "Vale para a próxima transmissão. Resolução e FPS são os mesmos do menu ⚙ do Go Live."),
+            item({type: "dropdown", id: "resolution", name: "Resolução", note: "Mesma configuração do Go Live do Discord.", options: resolutions}),
+            item({type: "dropdown", id: "fps", name: "Taxa de quadros", note: "Mesma configuração do Go Live do Discord.", options: framerates}),
+            item({type: "number", id: "maxBitrate", name: "Bitrate máximo (kbps)", note: "0 = automático pela resolução/FPS.", min: 0, max: 100000}),
+            item({type: "number", id: "minBitrate", name: "Bitrate mínimo (kbps)", note: "0 = sem mínimo. Nem todo navegador respeita.", min: 0, max: 100000}),
+            item({type: "number", id: "audioBitrate", name: "Bitrate do áudio (kbps)", note: "0 = padrão.", min: 0, max: 510}),
+            item({type: "dropdown", id: "videoCodec", name: "Codec de vídeo", note: "Preferência do transmissor.", options: CODEC_OPTIONS}));
+
+        this.api.UI.showConfirmationModal("Qualidade da transmissão", content, {
             confirmText: "Aplicar",
             cancelText: "Cancelar",
             onConfirm: () => {
-                Object.assign(s, draft);
+                Object.assign(s, {maxBitrate: draft.maxBitrate, minBitrate: draft.minBitrate, audioBitrate: draft.audioBitrate, videoCodec: draft.videoCodec});
                 this.saveSettings();
-                this.applyQualityLive();
+                const qualityChanged = draft.resolution !== current.resolution || draft.fps !== current.fps;
+                if (qualityChanged) this.requestLiveQuality({resolution: draft.resolution, fps: draft.fps});
+                if (this.share?.vdo && !qualityChanged) this.applyQualityLive();
+                if (!this.share) this.api.UI.showToast("VDOShare: qualidade salva para a próxima transmissão.", {type: "success"});
             }
         });
     }
 
-    /** Applies the current quality settings to a running stream without dropping viewers. */
+    /** Re-applies VDOShare's encoding options (bitrate/codec) to the running stream. */
     async applyQualityLive() {
         const share = this.share;
-        if (!share?.vdo || !share.source) {
-            this.api.UI.showToast("VDOShare: qualidade salva — vale para a próxima transmissão.", {type: "success"});
-            return;
-        }
+        if (!share?.vdo || !share.source) return;
         try {
-            const next = this.resolvePreset(share.source);
-            const recapture = next.height !== share.preset.height || next.frameRate !== share.preset.frameRate || next.width !== share.preset.width;
-            if (recapture) await this.switchSource(share.source);
-            else {
-                share.preset = next;
-                await this.applyEncoding(share, next);
-            }
-            this.api.UI.showToast(`VDOShare: qualidade aplicada — ${next.label}.`, {type: "success"});
+            share.preset = this.resolvePreset(share.source);
+            await this.applyEncoding(share, share.preset);
+            this.api.UI.showToast(`VDOShare: aplicado ao vivo — ${share.preset.label}, ${share.preset.maxBitrateKbps} kbps.`, {type: "success"});
         }
         catch (error) {
             this.api.Logger.error("Applying quality failed", error);
-            this.api.UI.showToast(`VDOShare: não consegui aplicar a qualidade — ${error.message}`, {type: "error"});
+            this.api.UI.showToast(`VDOShare: não consegui aplicar — ${error.message}`, {type: "error"});
         }
     }
 
@@ -956,27 +1309,15 @@ module.exports = class VDOShare {
     }
 
     /**
-     * Capture/encode settings for a Go Live pick ({resolution, fps}; resolution 0 =
-     * source), or for the custom values when "custom quality" is on.
+     * Capture/encode settings for a Discord quality choice ({resolution, fps};
+     * resolution 0 = source). Resolution/FPS always come from Discord; VDOShare
+     * only adds bitrate/codec on top.
      */
-    resolvePreset({resolution, fps}) {
+    resolvePreset({resolution, fps}, {ignoreOverrides = false} = {}) {
         const s = this.settings;
-        const unlocked = s.unlockQuality && (this.qualityUnlock?.validator || this.qualityUnlock?.check);
-        let height;
-        let frameRate;
-        if (s.customQuality) {
-            height = Number(s.customHeight) > 0 ? Math.round(Number(s.customHeight)) : 0;
-            frameRate = Number(s.customFps) || 30;
-        }
-        else {
-            height = Number(resolution) === 0 ? 0 : (Number(resolution) || 1080);
-            // Without the unlock a non-Nitro picker tops out at 720p, but the media
-            // doesn't go through Discord, so don't stay that low.
-            if (!unlocked && height) height = Math.max(height, 1080);
-            frameRate = Number(fps) || 30;
-        }
-        height = height ? Math.min(4320, Math.max(16, height)) : 0;
-        frameRate = Math.min(240, Math.max(1, Math.round(frameRate)));
+        let height = Number(resolution) === 0 ? 0 : (Number(resolution) || 720);
+        height = height ? Math.min(4320, Math.max(144, Math.round(height))) : 0;
+        const frameRate = Math.min(240, Math.max(1, Math.round(Number(fps) || 30)));
         const native = height === 0;
         // Max constraints only: Chromium keeps the aspect ratio and fits inside both,
         // so allow up to 32:9 to keep ultrawide screens at the requested height.
@@ -984,16 +1325,18 @@ module.exports = class VDOShare {
         const maxWidth = native ? 7680 : Math.round(height * 32 / 9);
         const pixels = (native ? 1440 : height) ** 2 * 16 / 9;
         const autoKbps = Math.min(20000, Math.max(1500, Math.round(pixels * Math.min(frameRate, 60) * 0.08 / 1000)));
+        const override = (key) => (!ignoreOverrides && Number(s[key]) > 0 ? Number(s[key]) : 0);
         return {
             width: maxWidth,
             height: maxHeight,
+            resolution: native ? 0 : height,
             frameRate,
-            maxBitrateKbps: Number(s.maxBitrate) > 0 ? Number(s.maxBitrate) : autoKbps,
-            minBitrateKbps: Number(s.minBitrate) > 0 ? Number(s.minBitrate) : 0,
-            audioBitrateKbps: Number(s.audioBitrate) > 0 ? Number(s.audioBitrate) : 0,
+            maxBitrateKbps: override("maxBitrate") || autoKbps,
+            minBitrateKbps: override("minBitrate"),
+            audioBitrateKbps: override("audioBitrate"),
             codec: s.videoCodec || "",
             sharp: frameRate <= 15,
-            label: `${native ? "nativa" : height + "p"}${frameRate}`
+            label: `${native ? "nativa" : height + "p"} ${frameRate}fps`
         };
     }
 
@@ -1066,6 +1409,7 @@ module.exports = class VDOShare {
             const stream = new MediaStream([videoTrack, ...(captured.audio ? [captured.audio] : [])]);
             this.share.mediaStream = stream;
             this.share.vdo = await this.publish(stream);
+            this.writeDiscordQuality({preset: source.preset, resolution: source.resolution, fps: source.fps, sound: Boolean(source.sound)});
 
             await this.setPresence();
             if (this.settings.copyViewerLink) this.copy(this.share.viewerUrl);
@@ -1084,31 +1428,56 @@ module.exports = class VDOShare {
         return this.startCaptureShare("native", source, onEnded);
     }
 
-    /** Go Live "change source": swap the published tracks without reconnecting viewers. */
+    /**
+     * Applies a new Go Live source/quality/sound to the running stream without
+     * dropping viewers: video is recaptured only when the source, resolution or
+     * FPS changed; sound is added/removed on the same connection.
+     */
     async switchSource(source) {
         const share = this.share;
         if (!share?.vdo) return this.startNativeShare(source);
-        source = {...share.source, ...source};
+        const previous = share.source;
+        source = {...previous, ...source};
         const preset = this.resolvePreset(source);
-        const captured = await captureSource({sourceId: source.sourceId, width: preset.width, height: preset.height, fps: preset.frameRate, wantAudio: source.sound});
-        captured.video.contentHint = preset.sharp ? "detail" : "motion";
+        const videoChanged = source.sourceId !== previous.sourceId || preset.height !== share.preset.height
+            || preset.width !== share.preset.width || preset.frameRate !== share.preset.frameRate;
+        const wantsNewAudio = Boolean(source.sound) && (videoChanged || !share.audioTrack);
+
+        let newAudio = null;
+        if (videoChanged || wantsNewAudio) {
+            const captured = await captureSource({sourceId: source.sourceId, width: preset.width, height: preset.height, fps: preset.frameRate, wantAudio: wantsNewAudio});
+            if (wantsNewAudio && !captured.audio) this.api.UI.showToast(`VDOShare: sem som — ${captured.audioError}`, {type: "warning", timeout: 8000});
+            newAudio = captured.audio;
+            if (videoChanged) {
+                captured.video.contentHint = preset.sharp ? "detail" : "motion";
+                const videoTrack = this.settings.keepAlive ? keepAlive(captured.video) : captured.video;
+                const oldVideo = share.videoTrack;
+                share.videoTrack = videoTrack;
+                videoTrack.addEventListener("ended", () => {
+                    if (this.share?.videoTrack === videoTrack) this.share.onEnded?.();
+                });
+                await share.vdo.replaceTrack(oldVideo, videoTrack);
+                try { oldVideo.stop(); } catch (_) { /* already stopped */ }
+            }
+            else captured.video.stop(); // only needed it to capture the sound
+        }
+
+        if (newAudio) {
+            if (share.audioTrack) await share.vdo.replaceTrack(share.audioTrack, newAudio);
+            else await share.vdo.addTrack(newAudio, share.mediaStream);
+            share.audioTrack = newAudio;
+        }
+        else if (!source.sound && share.audioTrack) {
+            const oldAudio = share.audioTrack;
+            share.audioTrack = null;
+            await share.vdo.removeTrack(oldAudio).catch(error => this.api.Logger.warn("removeTrack failed", error));
+            try { oldAudio.stop(); } catch (_) { /* already stopped */ }
+        }
+
         share.source = source;
         share.preset = preset;
-        const videoTrack = this.settings.keepAlive ? keepAlive(captured.video) : captured.video;
-        const oldVideo = share.videoTrack;
-        share.videoTrack = videoTrack;
-        videoTrack.addEventListener("ended", () => {
-            if (this.share?.videoTrack === videoTrack) this.share.onEnded?.();
-        });
-        await share.vdo.replaceTrack(oldVideo, videoTrack);
-        oldVideo.stop();
-        if (captured.audio && share.audioTrack) {
-            await share.vdo.replaceTrack(share.audioTrack, captured.audio);
-            share.audioTrack.stop();
-            share.audioTrack = captured.audio;
-        }
-        else captured.audio?.stop();
         await this.applyEncoding(share, preset);
+        this.writeDiscordQuality({preset: source.preset, resolution: source.resolution, fps: source.fps, sound: Boolean(source.sound)});
         this.bridge?.notifyVideoListeners();
     }
 
@@ -1153,7 +1522,8 @@ module.exports = class VDOShare {
         const source = await this.pickSource({askAudio: true});
         if (!source) return null;
         try {
-            await this.startCaptureShare("standalone", {sourceId: source.id, sourceName: source.name, sound: source.sound, resolution: 1080, fps: 30});
+            const quality = this.getDiscordQuality(); // same quality as Discord's Go Live settings
+            await this.startCaptureShare("standalone", {sourceId: source.id, sourceName: source.name, sound: source.sound, preset: quality.preset, resolution: quality.resolution, fps: quality.fps});
             return {content: `🔴 Ao vivo! Link para assistir: ${this.share.viewerUrl}`};
         }
         catch (error) {
@@ -1174,7 +1544,7 @@ module.exports = class VDOShare {
             this.api.Commands.register({
                 id: "vdoshare-qualidade",
                 name: "vdoshare-qualidade",
-                description: "Ajusta resolução, FPS e bitrate da transmissão VDOShare (aplica ao vivo)",
+                description: "Resolução, FPS (mesmos do Go Live), bitrate e codec da transmissão — aplica ao vivo",
                 execute: () => { this.openQualityModal(); }
             });
         }
@@ -1395,7 +1765,7 @@ module.exports = class VDOShare {
         const set = (key) => (value) => {
             s[key] = value;
             this.saveSettings();
-            if (this.share && ["customQuality", "customHeight", "customFps", "maxBitrate", "minBitrate", "audioBitrate", "videoCodec"].includes(key)) {
+            if (this.share && ["maxBitrate", "minBitrate", "audioBitrate", "videoCodec"].includes(key)) {
                 clearTimeout(this.qualityTimer);
                 this.qualityTimer = setTimeout(() => this.applyQualityLive(), 1200);
             }
@@ -1408,9 +1778,11 @@ module.exports = class VDOShare {
         const sw = (id, name, note) => ({type: "switch", id, name, note, value: !!s[id], onChange: set(id)});
         const num = (id, name, note, min, max) => ({type: "number", id, name, note, value: s[id], min, max, onChange: (v) => set(id)(Number(v))});
         const dd = (id, name, note, options) => ({type: "dropdown", id, name, note, value: s[id], options, onChange: set(id)});
-        const unlockStatus = this.qualityUnlock?.validator || this.qualityUnlock?.check
+        const unlockStatus = this.qualityUnlock?.validator
             ? ""
-            : " (Não encontrei as verificações de qualidade do Discord: o seletor pode continuar limitado, mas a qualidade personalizada funciona.)";
+            : " (Não encontrei a verificação de qualidade do Discord: algumas opções podem continuar travadas.)";
+        const discordQuality = this.share?.source ?? this.getDiscordQuality();
+        const qualityNow = `${this.resolutionLabel(Number(discordQuality.resolution) || 0, "Fonte")} · ${discordQuality.fps}fps`;
         const status = this.bridge
             ? (this.bridge.regionLocked ? "Go Live reativado (estava bloqueado na sua região)." : "Go Live nativo conectado.")
             : `Go Live nativo indisponível${this.bridgeError ? `: ${this.bridgeError}` : ""}. Use /vdoshare.`;
@@ -1447,12 +1819,10 @@ module.exports = class VDOShare {
                 {
                     type: "category", id: "quality", name: "Qualidade (resolução, FPS, bitrate)", collapsible: true, shown: true,
                     settings: [
-                        {type: "button", id: "qualityModal", name: "Ajuste rápido", note: `Predefinições e aplicação ao vivo. Também no botão "⚙ VDOShare" da janela do Go Live e em /vdoshare-qualidade.${unlockStatus}`,
-                            children: "Abrir", onClick: () => this.openQualityModal()},
-                        sw("unlockQuality", "Desbloquear todas as opções do Go Live", "Libera no seletor do Discord todas as resoluções (até Nativa) e FPS (até 60), sem Nitro."),
-                        sw("customQuality", "Usar qualidade personalizada", "Ignora o que foi escolhido no seletor e usa os valores abaixo."),
-                        num("customHeight", "Resolução (altura em px)", "0 = nativa. Ex.: 720, 1080, 1440, 2160.", 0, 4320),
-                        num("customFps", "FPS", "1–240", 1, 240),
+                        {type: "button", id: "qualityModal", name: `Resolução e FPS: ${qualityNow}`,
+                            note: `São as configurações do próprio Go Live do Discord (menu ⚙ da janela de compartilhar, ou "Configurações da transmissão" durante a live). Também em /vdoshare-qualidade. Mudanças valem na hora, sem compartilhar de novo.${unlockStatus}`,
+                            children: "Alterar", onClick: () => this.openQualityModal()},
+                        sw("unlockQuality", "Liberar opções Nitro da transmissão", "Em todo o Discord: todas as resoluções (até 4K e Fonte) e FPS (até 240) sem cadeado, sem o seletor SD/HD e sem o banner \"Obter o Nitro\" no Go Live."),
                         num("maxBitrate", "Bitrate máximo (kbps)", "0 = automático pela resolução/FPS (1,5–20 Mbps). Cada espectador consome esse upload.", 0, 100000),
                         num("minBitrate", "Bitrate mínimo (kbps)", "0 = sem mínimo.", 0, 100000),
                         num("audioBitrate", "Bitrate do áudio (kbps)", "0 = padrão.", 0, 510),
@@ -1520,13 +1890,7 @@ const PICKER_CSS = `
 .vdoshare-picker-item img { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #000; border-radius: 4px; }
 .vdoshare-picker-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vdoshare-picker-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.vdoshare-golive-btn { padding: 6px 12px; margin: 0 8px; border: 0; border-radius: 8px; cursor: pointer; font-weight: 600;
-    background: var(--control-secondary-background-default, var(--button-secondary-background, #4e5058)); color: var(--text-normal, #fff); }
-.vdoshare-golive-btn:hover { filter: brightness(1.15); }
 .vdoshare-quality { display: flex; flex-direction: column; gap: 4px; }
-.vdoshare-quality-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-.vdoshare-preset { padding: 6px 10px; border: 0; border-radius: 6px; cursor: pointer; font-size: 13px;
-    background: var(--brand-500, #5865f2); color: #fff; }
-.vdoshare-preset:hover { filter: brightness(1.1); }
+.vdoshare-quality-note { margin-bottom: 8px; font-size: 14px; color: var(--text-muted, #b5bac1); }
 .vdoshare-picker-cancel { margin-left: auto; padding: 8px 16px; border: 0; border-radius: 4px; cursor: pointer; background: var(--button-secondary-background, #4e5058); color: #fff; }
 `;
